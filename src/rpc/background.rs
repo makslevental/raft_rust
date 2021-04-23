@@ -45,11 +45,15 @@ fn handle_timeout(raft_node: Arc<Mutex<RaftNode>>, rpc_client: &RpcClient) {
         let last_log_index = 0;
         let last_log_term = 0;
 
-        let votes = rpc_client.request_votes(term, candidate_id, last_log_index, last_log_term);
-        let votes_for = votes.iter().filter(|r| r.vote_granted).count();
-        let won_election = (votes_for + 1) > *MIN_QUORUM
-            && Role::Candidate == raft_node.lock().unwrap().role
-            && !raft_node.lock().unwrap().has_timed_out();
+        // run the election
+        let mut won_election = false;
+        {
+            let votes = rpc_client.request_votes(term, candidate_id, last_log_index, last_log_term);
+            let votes_for = votes.iter().filter(|r| r.vote_granted).count();
+            won_election = (votes_for + 1) > *MIN_QUORUM
+                && Role::Candidate == raft_node.lock().unwrap().role
+                && !raft_node.lock().unwrap().has_timed_out();
+        }
 
         if won_election {
             raft_node.lock().unwrap().become_leader();
