@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::panic::panic_any;
-use std::sync::{Arc, Mutex};
+
+
 
 use crate::constants::MESSAGE_LENGTH;
-use crate::raft::types::{LogEntry, LogIndex, NodeId, RaftNode, Term};
+use crate::raft::types::{LogEntry, LogIndex, NodeId, Term};
 use crate::rpc::types::{
     AppendEntriesRequest, AppendEntriesResponse, Heartbeat, HeartbeatResponse, Peer, RpcClient,
     RpcMessage, VoteRequest, VoteRequestResponse,

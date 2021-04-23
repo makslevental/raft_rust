@@ -4,7 +4,7 @@ extern crate lazy_static;
 use crate::constants::NUM_SERVERS;
 use crate::raft::types::RaftNode;
 use crate::rpc::types::{Peer, RpcClient, RpcServer};
-use std::borrow::Borrow;
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,7 +24,7 @@ pub fn start_node(raft_node: Arc<Mutex<RaftNode>>, rpc_client: RpcClient) {
 }
 
 fn main() {
-    let node_ids = (0..NUM_SERVERS);
+    let node_ids = 0..NUM_SERVERS;
     let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
         .clone()
         .map(|i| Arc::new(Mutex::new(RaftNode::new(i as u64))))
@@ -67,7 +67,7 @@ fn main() {
         })
         .collect();
 
-    node_ids.clone().map(|i| {
+    node_ids.clone().for_each(|i| {
         start_node(
             Arc::clone(&raft_nodes[i as usize]),
             rpc_clients.remove(i as usize),

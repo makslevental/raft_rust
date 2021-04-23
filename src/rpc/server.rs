@@ -1,8 +1,6 @@
 use crate::constants::MESSAGE_LENGTH;
 use crate::raft::types::RaftNode;
-use crate::rpc::types::{
-    Heartbeat, HeartbeatResponse, RpcMessage, RpcServer, VoteRequest, VoteRequestResponse,
-};
+use crate::rpc::types::{HeartbeatResponse, RpcMessage, RpcServer, VoteRequestResponse};
 use log::info;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream};

@@ -1,20 +1,17 @@
-use std::collections::HashMap;
+
 use std::convert::TryInto;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+
+
+
 use std::time::{Duration, Instant};
 
 use log::info;
-use rand::prelude::ThreadRng;
+
 use rand::Rng;
 
 use crate::constants::{MAX_TIMEOUT, MIN_TIMEOUT, NUM_SERVERS};
-use crate::raft::types::{LogIndex, NodeId, PersistentState, RaftNode, Role, Term};
-use crate::rpc::types::{
-    AppendEntriesRequest, AppendEntriesResponse, Heartbeat, HeartbeatResponse, Peer, RpcMessage,
-    VoteRequest, VoteRequestResponse,
-};
+use crate::raft::types::{NodeId, PersistentState, RaftNode, Role, Term};
+
 
 impl RaftNode {
     pub fn new(id: NodeId) -> Self {
@@ -64,7 +61,7 @@ impl RaftNode {
         }
     }
 
-    pub fn handle_vote_request(self: &mut Self, term: Term, candidate_id: NodeId) -> (Term, bool) {
+    pub fn handle_vote_request(self: &mut Self, _term: Term, _candidate_id: NodeId) -> (Term, bool) {
         // match self.state.voted_for {
         //     Some(_) => (term, false),
         //     None => {

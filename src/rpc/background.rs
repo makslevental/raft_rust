@@ -3,12 +3,12 @@ use std::thread;
 use std::time::Duration;
 
 use log::info;
-use math::round;
+
 use rand::Rng;
 
-use crate::constants::{MIN_QUORUM, NUM_SERVERS};
+use crate::constants::MIN_QUORUM;
 use crate::raft::types::{RaftNode, Role};
-use crate::rpc::types::{RpcClient, VoteRequest};
+use crate::rpc::types::RpcClient;
 
 pub(crate) fn background_task(raft_node: Arc<Mutex<RaftNode>>, rpc_client: &RpcClient) {
     loop {
@@ -46,7 +46,7 @@ fn handle_timeout(raft_node: Arc<Mutex<RaftNode>>, rpc_client: &RpcClient) {
         let last_log_term = 0;
 
         // run the election
-        let mut won_election = false;
+        let won_election;
         {
             let votes = rpc_client.request_votes(term, candidate_id, last_log_index, last_log_term);
             let votes_for = votes.iter().filter(|r| r.vote_granted).count();
