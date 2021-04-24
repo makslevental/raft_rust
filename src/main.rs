@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate lazy_static;
 
+use std::any::Any;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,12 +9,10 @@ use std::thread;
 use raft::types::Peer;
 
 use crate::constants::NUM_SERVERS;
-use crate::raft::types::RaftNode;
-use crate::rpc::types::{RpcClient, RpcServer};
+use crate::raft::types::{Message, RaftNode};
 
 mod constants;
 mod raft;
-mod rpc;
 
 // pub fn start_node(raft_node: Arc<Mutex<RaftNode>>, rpc_client: RpcClient) {
 //     raft_node.lock().unwrap().refresh_timeout();

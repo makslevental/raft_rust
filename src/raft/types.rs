@@ -59,6 +59,7 @@ pub struct RaftNode {
     pub leader_state: Option<LeaderState>,
     pub maintenance: Maintenance,
     pub id: NodeId,
+    pub address: SocketAddrV4,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
