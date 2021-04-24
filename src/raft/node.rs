@@ -2,14 +2,14 @@ use std::cmp::min;
 use std::convert::TryInto;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::info;
 use rand::Rng;
 
-use crate::constants::{MAX_TIMEOUT, MESSAGE_LENGTH, MIN_QUORUM, MIN_TIMEOUT, NUM_SERVERS};
+use crate::constants::{MAX_TIMEOUT, MESSAGE_LENGTH, MIN_QUORUM, MIN_TIMEOUT};
 use crate::raft::types::{
     LogEntry, LogIndex, LogTerm, Maintenance, Message, NodeId, Peer, PersistentState, RaftNode,
     Role, VolatileState,
@@ -50,7 +50,7 @@ impl RaftNode {
         info!("Starting server at: {}...", address);
         let listener = TcpListener::bind(address).unwrap();
         for stream in listener.incoming() {
-            let mut this_clone = Arc::clone(&this);
+            let this_clone = Arc::clone(&this);
             match stream {
                 Ok(stream) => {
                     thread::spawn(move || this_clone.lock().unwrap().handle_connection(stream));
@@ -62,7 +62,7 @@ impl RaftNode {
         }
 
         // background tasks
-        let mut this_clone = Arc::clone(&this);
+        let this_clone = Arc::clone(&this);
         thread::spawn(move || loop {
             let mut this_node = this_clone.lock().unwrap();
 
@@ -138,10 +138,10 @@ impl RaftNode {
 
     pub fn handle_vote_request(
         self: &mut Self,
-        term: LogTerm,
-        candidate_id: NodeId,
-        last_log_index: LogIndex,
-        last_log_term: LogTerm,
+        _term: LogTerm,
+        _candidate_id: NodeId,
+        _last_log_index: LogIndex,
+        _last_log_term: LogTerm,
     ) -> (LogTerm, bool) {
         // match self.state.voted_for {
         //     Some(_) => (term, false),
@@ -284,10 +284,10 @@ impl RaftNode {
     fn check_timeout(self: &mut Self) {
         if self.has_timed_out() {
             info!("Server {} has timed out and has started election.", self.id);
-            let term = self.prepare_for_election();
+            let _term = self.prepare_for_election();
             // TODO
-            let last_log_index = 0;
-            let last_log_term = 0;
+            let _last_log_index = 0;
+            let _last_log_term = 0;
 
             // run the election
             // let won_election;

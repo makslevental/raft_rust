@@ -1,15 +1,15 @@
 #[macro_use]
 extern crate lazy_static;
 
-use std::any::Any;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
-use std::thread;
 
-use raft::types::Peer;
+
+
+
+
+
 
 use crate::constants::NUM_SERVERS;
-use crate::raft::types::{Message, RaftNode};
+
 
 mod constants;
 mod raft;
@@ -25,7 +25,7 @@ mod raft;
 // }
 
 fn main() {
-    let node_ids = 0..NUM_SERVERS;
+    let _node_ids = 0..NUM_SERVERS;
     // let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
     //     .clone()
     //     .map(|i| Arc::new(Mutex::new(RaftNode::new(i as u64))))
