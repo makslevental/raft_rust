@@ -1,18 +1,22 @@
+use std::collections::HashMap;
+use std::net::{SocketAddrV4, TcpStream};
+use std::sync::Mutex;
+use std::thread::{JoinHandle, Thread};
+use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 
-use std::time::{Instant};
+use crate::constants::NUM_SERVERS;
 
-
-
-
-
-
-use crate::constants::{NUM_SERVERS};
-
-pub type Term = u64;
+pub type LogTerm = u64;
 pub type NodeId = u64;
-pub type LogEntry = String;
-pub type LogIndex = u32;
+pub type LogIndex = usize;
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub message: String,
+    pub term: LogTerm,
+}
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Role {
@@ -23,23 +27,76 @@ pub enum Role {
 
 #[derive(Debug)]
 pub struct PersistentState {
-    pub current_term: Term,
+    pub current_term: LogTerm,
     pub voted_for: Option<NodeId>,
     pub log: Vec<LogEntry>,
 }
 
 #[derive(Debug)]
-pub struct RaftNode {
-    pub state: PersistentState,
+pub struct VolatileState {
+    pub commit_index: LogIndex,
+    pub last_applied: LogIndex,
+}
 
-    pub commit_index: Vec<LogIndex>,
-    pub last_applied: Vec<LogIndex>,
-
+#[derive(Debug)]
+pub struct LeaderState {
     pub next_index: [LogIndex; NUM_SERVERS],
     pub match_index: [LogIndex; NUM_SERVERS],
+}
 
-    pub id: NodeId,
+#[derive(Debug)]
+pub struct Maintenance {
     pub current_leader: Option<NodeId>,
     pub role: Role,
     pub next_timeout: Option<Instant>,
+    pub peer_nodes: HashMap<String, TcpStream>,
+}
+
+#[derive(Debug)]
+pub struct RaftNode {
+    pub persistent_state: PersistentState,
+    pub volatile_state: VolatileState,
+    pub leader_state: Option<LeaderState>,
+    pub maintenance: Maintenance,
+    pub id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Message {
+    VoteRequest {
+        term: LogTerm,
+        candidate_id: NodeId,
+        last_log_index: LogIndex,
+        last_log_term: LogTerm,
+    },
+    VoteRequestResponse {
+        term: LogTerm,
+        vote_granted: bool,
+    },
+    AppendEntriesRequest {
+        term: LogTerm,
+        leader_id: NodeId,
+        prev_log_index: LogIndex,
+        prev_log_term: LogTerm,
+        entries: Vec<LogEntry>,
+        leader_commit: LogIndex,
+    },
+    AppendEntriesResponse {
+        term: LogTerm,
+        success: bool,
+    },
+    Heartbeat {
+        term: LogTerm,
+        node_id: NodeId,
+    },
+    HeartbeatResponse {
+        success: bool,
+        node_id: NodeId,
+    },
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct Peer {
+    pub id: NodeId,
+    pub address: SocketAddrV4,
 }

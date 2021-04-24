@@ -1,11 +1,13 @@
-use crate::constants::MESSAGE_LENGTH;
-use crate::raft::types::RaftNode;
-use crate::rpc::types::{HeartbeatResponse, RpcMessage, RpcServer, VoteRequestResponse};
-use log::info;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use log::info;
+
+use crate::constants::MESSAGE_LENGTH;
+use crate::raft::types::{Message, RaftNode};
+use crate::rpc::types::RpcServer;
 
 impl RpcServer {
     pub fn new(raft_node: Arc<Mutex<RaftNode>>, address: SocketAddrV4) -> Self {
@@ -36,23 +38,45 @@ fn handle_connection(raft_node: Arc<Mutex<RaftNode>>, mut stream: TcpStream) {
         let mut buffer = [0; MESSAGE_LENGTH];
         stream.read(&mut buffer).unwrap();
 
-        let deserialized: RpcMessage = bincode::deserialize(&buffer).unwrap();
+        let deserialized: Message = bincode::deserialize(&buffer).unwrap();
 
         let response = match deserialized {
-            RpcMessage::VoteRequest(v) => {
-                let (term, vote_granted) = raft_node
-                    .lock()
-                    .unwrap()
-                    .handle_vote_request(v.term, v.candidate_id);
-                bincode::serialize(&VoteRequestResponse { term, vote_granted }).unwrap()
+            // TODO missing other fields from voterequets
+            Message::VoteRequest {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                let (term, vote_granted) = raft_node.lock().unwrap().handle_vote_request(
+                    term,
+                    candidate_id,
+                    last_log_index,
+                    last_log_term,
+                );
+                bincode::serialize(&Message::VoteRequestResponse { term, vote_granted }).unwrap()
             }
-            // RpcMessage::AppendEntriesRequest(v) => raft_node.lock().unwrap().handle_vote_request(v),
-            RpcMessage::Heartbeat(v) => {
-                let (success, node_id) = raft_node
-                    .lock()
-                    .unwrap()
-                    .handle_heartbeat(v.term, v.node_id);
-                bincode::serialize(&HeartbeatResponse { success, node_id }).unwrap()
+            Message::AppendEntriesRequest {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
+                let (term, success) = raft_node.lock().unwrap().handele_append_entries(
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                );
+                bincode::serialize(&Message::AppendEntriesResponse { term, success }).unwrap()
+            }
+            Message::Heartbeat { term, node_id } => {
+                let (success, node_id) = raft_node.lock().unwrap().handle_heartbeat(term, node_id);
+                bincode::serialize(&Message::HeartbeatResponse { success, node_id }).unwrap()
             }
             _ => todo!(), // Response messages;
         };
