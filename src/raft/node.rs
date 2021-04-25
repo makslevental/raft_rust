@@ -16,7 +16,7 @@ use crate::raft::types::{
 };
 
 impl RaftNode {
-    pub fn new(id: NodeId, address: SocketAddrV4, peers: &Vec<Peer>) -> Self {
+    pub fn new(id: NodeId, address: SocketAddrV4) -> Self {
         RaftNode {
             persistent_state: PersistentState {
                 current_term: 0,
@@ -32,35 +32,14 @@ impl RaftNode {
                 current_leader: None,
                 role: Role::Follower,
                 next_timeout: None,
-                peer_nodes: peers
-                    .iter()
-                    .map(|p| (p.id.to_string(), TcpStream::connect(&p.address).unwrap()))
-                    .collect(),
+                peer_nodes: None,
             },
             id,
             address,
         }
     }
 
-    pub fn start(this: Arc<Mutex<Self>>) {
-        let address;
-        {
-            address = Arc::clone(&this).lock().unwrap().address;
-        }
-        info!("Starting server at: {}...", address);
-        let listener = TcpListener::bind(address).unwrap();
-        for stream in listener.incoming() {
-            let this_clone = Arc::clone(&this);
-            match stream {
-                Ok(stream) => {
-                    thread::spawn(move || this_clone.lock().unwrap().handle_connection(stream));
-                }
-                Err(e) => {
-                    info!("Error while listening to client: {}", e);
-                }
-            }
-        }
-
+    pub fn start_client(this: Arc<Mutex<Self>>) {
         // background tasks
         let this_clone = Arc::clone(&this);
         thread::spawn(move || loop {
@@ -78,6 +57,33 @@ impl RaftNode {
 
             thread::sleep(Duration::from_millis(1));
         });
+    }
+
+    pub fn start_server(this: Arc<Mutex<Self>>) {
+        let address;
+        {
+            address = Arc::clone(&this).lock().unwrap().address;
+        }
+        info!("Starting server at: {}...", address);
+        let listener = TcpListener::bind(address).unwrap();
+        for stream in listener.incoming() {
+            let this_clone = Arc::clone(&this);
+            match stream {
+                Ok(stream) => {
+                    thread::spawn(move || this_clone.lock().unwrap().handle_connection(stream));
+                }
+                Err(e) => {
+                    info!("Error while listening to client: {}", e);
+                }
+            }
+        }
+    }
+
+    pub fn set_peers(&mut self, peers: &Vec<Peer>) {
+        // self.maintenance.peer_nodes = peers
+        //     .iter()
+        //     .map(|p| (p.id.to_string(), TcpStream::connect(&p.address).unwrap()))
+        //     .collect();
     }
 
     pub fn run_election(&mut self) {
@@ -313,7 +319,7 @@ impl RaftNode {
                     let (success, node_id) = self.handle_heartbeat(term, node_id);
                     bincode::serialize(&Message::HeartbeatResponse { success, node_id }).unwrap()
                 }
-                _ => todo!(), // Response messages;
+                _ => panic!(), // Response messages;
             };
 
             stream.write(&response).unwrap();
@@ -325,7 +331,7 @@ impl RaftNode {
         let request_vote_bin = bincode::serialize(&rpc_message).unwrap();
         let mut rpc_responses: Vec<Message> = Vec::new();
 
-        for mut stream in self.maintenance.peer_nodes.values() {
+        for mut stream in self.maintenance.peer_nodes.as_ref().unwrap().values() {
             stream.write(&request_vote_bin).unwrap();
 
             let mut buffer = [0; MESSAGE_LENGTH];
@@ -333,5 +339,41 @@ impl RaftNode {
             rpc_responses.push(bincode::deserialize(&buffer).unwrap());
         }
         rpc_responses
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::NUM_SERVERS;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn create_nodes() {
+        let node_ids = 0..3;
+        let peers: Vec<Peer> = node_ids
+            .clone()
+            .map(|i| Peer {
+                id: i as u64,
+                address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, (3300 + i) as u16),
+            })
+            .collect();
+
+        let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
+            .clone()
+            .map(|i| {
+                Arc::new(Mutex::new(RaftNode::new(
+                    i as u64,
+                    peers[i as usize].address,
+                )))
+            })
+            .collect();
+
+        // &peers
+        //     .clone()
+        //     .into_iter()
+        //     .filter(|p| p.id != i as u64)
+        //     .collect(),
+        // raft_nodes.into_iter().for_each(|r| RaftNode::start(r))
     }
 }

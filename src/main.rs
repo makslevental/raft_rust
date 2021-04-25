@@ -20,29 +20,12 @@ mod raft;
 // }
 
 fn main() {
-    let node_ids = 0..NUM_SERVERS;
-    let peers: Vec<Peer> = node_ids
-        .clone()
-        .map(|i| Peer {
-            id: i as u64,
-            address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, (3300 + i) as u16),
-        })
-        .collect();
+    println!("hello world");
 
-    let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
-        .clone()
-        .map(|i| {
-            Arc::new(Mutex::new(RaftNode::new(
-                i as u64,
-                peers[i as usize].address,
-                &peers
-                    .clone()
-                    .into_iter()
-                    .filter(|p| p.id != i as u64)
-                    .collect(),
-            )))
-        })
-        .collect();
-
-    raft_nodes.into_iter().for_each(|r| RaftNode::start(r))
+    // &peers
+    //     .clone()
+    //     .into_iter()
+    //     .filter(|p| p.id != i as u64)
+    //     .collect(),
+    // raft_nodes.into_iter().for_each(|r| RaftNode::start(r))
 }

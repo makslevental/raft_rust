@@ -48,7 +48,7 @@ pub struct Maintenance {
     pub current_leader: Option<NodeId>,
     pub role: Role,
     pub next_timeout: Option<Instant>,
-    pub peer_nodes: HashMap<String, TcpStream>,
+    pub peer_nodes: Option<HashMap<String, TcpStream>>,
 }
 
 #[derive(Debug)]
