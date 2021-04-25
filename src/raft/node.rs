@@ -42,7 +42,7 @@ impl RaftNode {
         }
     }
 
-    fn start(this: Arc<Mutex<Self>>) {
+    pub fn start(this: Arc<Mutex<Self>>) {
         let address;
         {
             address = Arc::clone(&this).lock().unwrap().address;
@@ -216,14 +216,6 @@ impl RaftNode {
         // }
     }
 
-    pub fn prepare_for_election(self: &mut Self) -> LogTerm {
-        self.maintenance.role = Role::Candidate;
-        self.persistent_state.current_term += 1;
-        self.refresh_timeout();
-        self.persistent_state.voted_for = Some(self.id);
-        self.persistent_state.current_term
-    }
-
     pub(crate) fn request_votes(
         &self,
         term: LogTerm,
@@ -279,36 +271,7 @@ impl RaftNode {
     }
 }
 
-// background
 impl RaftNode {
-    fn check_timeout(self: &mut Self) {
-        if self.has_timed_out() {
-            info!("Server {} has timed out and has started election.", self.id);
-            let _term = self.prepare_for_election();
-            // TODO
-            let _last_log_index = 0;
-            let _last_log_term = 0;
-
-            // run the election
-            // let won_election;
-            // {
-            //     let votes =
-            //         rpc_client.request_votes(term, candidate_id, last_log_index, last_log_term);
-            //     let votes_for = votes.iter().filter(|r| r.vote_granted).count();
-            //     won_election = (votes_for + 1) > *MIN_QUORUM
-            //         && Role::Candidate == raft_node.lock().unwrap().role
-            //         && !raft_node.lock().unwrap().has_timed_out();
-            // }
-            //
-            // if won_election {
-            //     raft_node.lock().unwrap().become_leader();
-            //     let current_term = raft_node.lock().unwrap().state.current_term;
-            //     let node_id = raft_node.lock().unwrap().id;
-            //     rpc_client.broadcast_heartbeat(current_term, node_id);
-            // }
-        }
-    }
-
     fn handle_connection(&mut self, mut stream: TcpStream) {
         loop {
             let mut buffer = [0; MESSAGE_LENGTH];
@@ -357,10 +320,7 @@ impl RaftNode {
             stream.flush().unwrap();
         }
     }
-}
 
-// RPC
-impl RaftNode {
     fn send(&self, rpc_message: Message) -> Vec<Message> {
         let request_vote_bin = bincode::serialize(&rpc_message).unwrap();
         let mut rpc_responses: Vec<Message> = Vec::new();
