@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use log::info;
 use rand::Rng;
 
 use crate::constants::{MAX_TIMEOUT, MESSAGE_LENGTH, MIN_QUORUM, MIN_TIMEOUT};
@@ -40,14 +39,14 @@ impl RaftNode {
     }
 
     pub fn start_background_tasks(this: Arc<Mutex<Self>>) {
-        // background tasks
         let this_clone = Arc::clone(&this);
-        thread::spawn(move || loop {
+        this_clone.lock().unwrap().refresh_timeout();
+        let handle = thread::spawn(move || loop {
             let mut this_node = this_clone.lock().unwrap();
 
             // broadcast heartbeat if leader
             if this_node.maintenance.role == Role::Leader {
-                this_node.broadcast_heartbeat();
+                this_node.send_heartbeat();
             }
 
             // not leader therefore check time out and run election
@@ -57,6 +56,8 @@ impl RaftNode {
 
             thread::sleep(Duration::from_millis(1));
         });
+
+        handle.join().unwrap();
     }
 
     pub fn start_server(this: Arc<Mutex<Self>>) {
@@ -68,7 +69,6 @@ impl RaftNode {
         let listener = TcpListener::bind(address).unwrap();
         thread::spawn(move || {
             for stream in listener.incoming() {
-                // println!("Server {} listens to stream {:?}", address, stream);
                 let this = this.clone();
                 match stream {
                     Ok(stream) => {
@@ -99,23 +99,15 @@ impl RaftNode {
         self.persistent_state.voted_for = Some(self.id);
 
         // request votes
-        let votes = self.request_votes(
+        let votes = self.send_vote_requests(
             self.persistent_state.current_term,
             self.id,
             // TODO: what's the right thing here
             0,
             0,
         );
-
         // count votes
-        let votes_for = votes
-            .iter()
-            .map(|v| match *v {
-                Message::VoteRequestResponse { vote_granted, .. } => vote_granted,
-                _ => panic!(),
-            })
-            .filter(|v| *v)
-            .count();
+        let votes_for = votes.into_iter().filter(|(_term, vote)| *vote).count();
 
         // if election won
         if (votes_for + 1) > *MIN_QUORUM {
@@ -125,7 +117,7 @@ impl RaftNode {
             );
             self.maintenance.role = Role::Leader;
             self.maintenance.next_timeout = None;
-            self.broadcast_heartbeat();
+            self.send_heartbeat();
         }
     }
 
@@ -147,6 +139,30 @@ impl RaftNode {
         }
     }
 
+    pub fn send_vote_requests(
+        &self,
+        term: LogTerm,
+        candidate_id: NodeId,
+        last_log_index: LogIndex,
+        last_log_term: LogTerm,
+    ) -> Vec<(LogTerm, bool)> {
+        let message = Message::VoteRequest {
+            term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+        };
+        let responses = self.send(message);
+        // count votes
+        responses
+            .iter()
+            .map(|v| match *v {
+                Message::VoteRequestResponse { vote_granted, term } => (term, vote_granted),
+                _ => panic!(),
+            })
+            .collect()
+    }
+
     pub fn handle_vote_request(
         self: &mut Self,
         _term: LogTerm,
@@ -166,6 +182,65 @@ impl RaftNode {
         //     }
         // }
         todo!()
+    }
+
+    fn send_heartbeat(&self) {
+        let rpc_message = Message::Heartbeat {
+            term: self.persistent_state.current_term,
+            node_id: self.id,
+        };
+        let responses = self.send(rpc_message);
+        responses.into_iter().map(|x| match x {
+            Message::HeartbeatResponse { .. } => x,
+            _ => panic!(),
+        });
+
+        // A touch of randomness, so that we can get the chance
+        // to have other leader elections.
+        let mut rng = rand::thread_rng();
+        thread::sleep(Duration::new(rng.gen_range(1..7), 0));
+    }
+
+    pub fn handle_heartbeat(self: &mut Self, term: LogTerm, node_id: NodeId) -> (bool, NodeId) {
+        println!(
+            "Server {} with term {}, received heartbeat from {} with term {}",
+            self.id, self.persistent_state.current_term, node_id, term
+        );
+
+        todo!()
+        // self.refresh_timeout();
+        //
+        // if term > self.state.current_term {
+        //     println!(
+        //         "Server {} becoming follower. The new leader is: {}",
+        //         self.id, node_id
+        //     );
+        //
+        //     (term, true)
+        // } else {
+        //     (self.state.current_term, false)
+        // }
+    }
+
+    fn send_append_entries(&self, entries: Vec<LogEntry>) -> Vec<Message> {
+        let rpc_message = Message::AppendEntriesRequest {
+            term: self.persistent_state.current_term,
+            leader_id: self.id,
+            // TODO: is this the right index and term???
+            // This is definitely wrong
+            prev_log_index: self.volatile_state.commit_index,
+            prev_log_term: self.persistent_state.current_term,
+            entries,
+            leader_commit: self.volatile_state.commit_index,
+        };
+        let rpc_responses = self.send(rpc_message);
+        rpc_responses
+            .into_iter()
+            .map(|x| match x {
+                Message::AppendEntriesResponse { .. } => x,
+                _ => panic!(),
+            })
+            .collect()
     }
 
     pub fn handele_append_entries(
@@ -204,81 +279,6 @@ impl RaftNode {
 
         self.maintenance.current_leader = Some(leader_id);
         (self.persistent_state.current_term, true)
-    }
-
-    pub fn handle_heartbeat(self: &mut Self, term: LogTerm, node_id: NodeId) -> (bool, NodeId) {
-        println!(
-            "Server {} with term {}, received heartbeat from {} with term {}",
-            self.id, self.persistent_state.current_term, node_id, term
-        );
-
-        todo!()
-        // self.refresh_timeout();
-        //
-        // if term > self.state.current_term {
-        //     println!(
-        //         "Server {} becoming follower. The new leader is: {}",
-        //         self.id, node_id
-        //     );
-        //
-        //     (term, true)
-        // } else {
-        //     (self.state.current_term, false)
-        // }
-    }
-
-    pub(crate) fn request_votes(
-        &self,
-        term: LogTerm,
-        candidate_id: NodeId,
-        last_log_index: LogIndex,
-        last_log_term: LogTerm,
-    ) -> Vec<Message> {
-        let message = Message::VoteRequest {
-            term,
-            candidate_id,
-            last_log_index,
-            last_log_term,
-        };
-        self.send(message)
-    }
-
-    fn broadcast_heartbeat(&self) {
-        let rpc_message = Message::Heartbeat {
-            term: self.persistent_state.current_term,
-            node_id: self.id,
-        };
-        let responses = self.send(rpc_message);
-        responses.into_iter().map(|x| match x {
-            Message::HeartbeatResponse { .. } => x,
-            _ => panic!(),
-        });
-
-        // A touch of randomness, so that we can get the chance
-        // to have other leader elections.
-        let mut rng = rand::thread_rng();
-        thread::sleep(Duration::new(rng.gen_range(1..7), 0));
-    }
-
-    fn send_append_entries(&self, entries: Vec<LogEntry>) -> Vec<Message> {
-        let rpc_message = Message::AppendEntriesRequest {
-            term: self.persistent_state.current_term,
-            leader_id: self.id,
-            // TODO: is this the right index and term???
-            // This is definitely wrong
-            prev_log_index: self.volatile_state.commit_index,
-            prev_log_term: self.persistent_state.current_term,
-            entries,
-            leader_commit: self.volatile_state.commit_index,
-        };
-        let rpc_responses = self.send(rpc_message);
-        rpc_responses
-            .into_iter()
-            .map(|x| match x {
-                Message::AppendEntriesResponse { .. } => x,
-                _ => panic!(),
-            })
-            .collect()
     }
 }
 
@@ -437,6 +437,49 @@ mod tests {
         // raft_nodes
         //     .iter()
         //     .for_each(|r| RaftNode::start_background_tasks(r.clone()));
+
+        // loop {}
+    }
+
+    #[test]
+    fn check_bg_tasks() {
+        let node_ids = 0..3;
+        let peers: Vec<Peer> = node_ids
+            .clone()
+            .map(|i| Peer {
+                id: i as u64,
+                address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, (3300 + i) as u16),
+            })
+            .collect();
+
+        let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
+            .clone()
+            .map(|i| {
+                Arc::new(Mutex::new(RaftNode::new(
+                    i as u64,
+                    peers[i as usize].address,
+                )))
+            })
+            .collect();
+
+        raft_nodes
+            .iter()
+            .for_each(|r| RaftNode::start_server(r.clone()));
+
+        raft_nodes.iter().for_each(|r| {
+            let rid = r.clone().lock().unwrap().id;
+            r.clone().lock().unwrap().set_peers(
+                &peers
+                    .clone()
+                    .into_iter()
+                    .filter(|p| p.id != rid as u64)
+                    .collect(),
+            )
+        });
+
+        raft_nodes
+            .iter()
+            .for_each(|r| RaftNode::start_background_tasks(r.clone()));
 
         // loop {}
     }
