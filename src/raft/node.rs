@@ -39,7 +39,7 @@ impl RaftNode {
         }
     }
 
-    pub fn start_client(this: Arc<Mutex<Self>>) {
+    pub fn start_background_tasks(this: Arc<Mutex<Self>>) {
         // background tasks
         let this_clone = Arc::clone(&this);
         thread::spawn(move || loop {
@@ -64,26 +64,31 @@ impl RaftNode {
         {
             address = Arc::clone(&this).lock().unwrap().address;
         }
-        info!("Starting server at: {}...", address);
+        println!("Starting server at: {}...", address);
         let listener = TcpListener::bind(address).unwrap();
-        for stream in listener.incoming() {
-            let this_clone = Arc::clone(&this);
-            match stream {
-                Ok(stream) => {
-                    thread::spawn(move || this_clone.lock().unwrap().handle_connection(stream));
-                }
-                Err(e) => {
-                    info!("Error while listening to client: {}", e);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                // println!("Server {} listens to stream {:?}", address, stream);
+                let this = this.clone();
+                match stream {
+                    Ok(stream) => {
+                        thread::spawn(move || Self::handle_connection(this, stream));
+                    }
+                    Err(e) => {
+                        println!("Error while listening to client: {}", e);
+                    }
                 }
             }
-        }
+        });
     }
 
     pub fn set_peers(&mut self, peers: &Vec<Peer>) {
-        // self.maintenance.peer_nodes = peers
-        //     .iter()
-        //     .map(|p| (p.id.to_string(), TcpStream::connect(&p.address).unwrap()))
-        //     .collect();
+        self.maintenance.peer_nodes = Some(
+            peers
+                .iter()
+                .map(|p| (p.id.to_string(), TcpStream::connect(&p.address).unwrap()))
+                .collect(),
+        );
     }
 
     pub fn run_election(&mut self) {
@@ -114,7 +119,7 @@ impl RaftNode {
 
         // if election won
         if (votes_for + 1) > *MIN_QUORUM {
-            info!(
+            println!(
                 "Server {} has won the election! The new term is: {}",
                 self.id, self.persistent_state.current_term
             );
@@ -202,7 +207,7 @@ impl RaftNode {
     }
 
     pub fn handle_heartbeat(self: &mut Self, term: LogTerm, node_id: NodeId) -> (bool, NodeId) {
-        info!(
+        println!(
             "Server {} with term {}, received heartbeat from {} with term {}",
             self.id, self.persistent_state.current_term, node_id, term
         );
@@ -211,7 +216,7 @@ impl RaftNode {
         // self.refresh_timeout();
         //
         // if term > self.state.current_term {
-        //     info!(
+        //     println!(
         //         "Server {} becoming follower. The new leader is: {}",
         //         self.id, node_id
         //     );
@@ -278,13 +283,15 @@ impl RaftNode {
 }
 
 impl RaftNode {
-    fn handle_connection(&mut self, mut stream: TcpStream) {
+    fn handle_connection(this: Arc<Mutex<Self>>, mut stream: TcpStream) {
+        let this = Arc::clone(&this);
         loop {
             let mut buffer = [0; MESSAGE_LENGTH];
             stream.read(&mut buffer).unwrap();
 
             let d: Message = bincode::deserialize(&buffer).unwrap();
 
+            let mut this = this.lock().unwrap();
             let response = match d {
                 Message::VoteRequest {
                     term,
@@ -293,7 +300,7 @@ impl RaftNode {
                     last_log_term,
                 } => {
                     let (term, vote_granted) =
-                        self.handle_vote_request(term, candidate_id, last_log_index, last_log_term);
+                        this.handle_vote_request(term, candidate_id, last_log_index, last_log_term);
                     bincode::serialize(&Message::VoteRequestResponse { term, vote_granted })
                         .unwrap()
                 }
@@ -305,7 +312,7 @@ impl RaftNode {
                     entries,
                     leader_commit,
                 } => {
-                    let (term, success) = self.handele_append_entries(
+                    let (term, success) = this.handele_append_entries(
                         term,
                         leader_id,
                         prev_log_index,
@@ -316,7 +323,7 @@ impl RaftNode {
                     bincode::serialize(&Message::AppendEntriesResponse { term, success }).unwrap()
                 }
                 Message::Heartbeat { term, node_id } => {
-                    let (success, node_id) = self.handle_heartbeat(term, node_id);
+                    let (success, node_id) = this.handle_heartbeat(term, node_id);
                     bincode::serialize(&Message::HeartbeatResponse { success, node_id }).unwrap()
                 }
                 _ => panic!(), // Response messages;
@@ -344,9 +351,10 @@ impl RaftNode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::constants::NUM_SERVERS;
     use std::net::Ipv4Addr;
+
+    use super::*;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn create_nodes() {
@@ -369,11 +377,67 @@ mod tests {
             })
             .collect();
 
-        // &peers
-        //     .clone()
-        //     .into_iter()
-        //     .filter(|p| p.id != i as u64)
-        //     .collect(),
-        // raft_nodes.into_iter().for_each(|r| RaftNode::start(r))
+        raft_nodes
+            .iter()
+            .for_each(|r| RaftNode::start_server(r.clone()));
+
+        raft_nodes.iter().for_each(|r| {
+            let rid = r.clone().lock().unwrap().id;
+            r.clone().lock().unwrap().set_peers(
+                &peers
+                    .clone()
+                    .into_iter()
+                    .filter(|p| p.id != rid as u64)
+                    .collect(),
+            )
+        });
+
+        let mut connections: HashMap<String, HashSet<String>> = HashMap::new();
+        for raft_node in &raft_nodes {
+            let address = raft_node.lock().as_ref().unwrap().address;
+            for (ip_address, connection) in raft_node
+                .lock()
+                .as_ref()
+                .unwrap()
+                .maintenance
+                .peer_nodes
+                .as_ref()
+                .unwrap()
+            {
+                let k = address.to_string();
+                let v = connection.peer_addr().unwrap().to_string();
+                if !connections.contains_key(&k) {
+                    connections.insert(k.clone(), HashSet::new());
+                }
+                connections.get_mut(&k).unwrap().insert(v);
+            }
+        }
+        assert_eq!(
+            connections[&"127.0.0.1:3300".to_string()],
+            ["127.0.0.1:3301", "127.0.0.1:3302"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        assert_eq!(
+            connections[&"127.0.0.1:3301".to_string()],
+            ["127.0.0.1:3300", "127.0.0.1:3302"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        assert_eq!(
+            connections[&"127.0.0.1:3302".to_string()],
+            ["127.0.0.1:3300", "127.0.0.1:3301"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+
+        // raft_nodes
+        //     .iter()
+        //     .for_each(|r| RaftNode::start_background_tasks(r.clone()));
+
+        // loop {}
     }
 }

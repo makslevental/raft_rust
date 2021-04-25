@@ -1,7 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
 
-use crate::constants::NUM_SERVERS;
 use crate::raft::types::{Peer, RaftNode};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
@@ -20,12 +19,41 @@ mod raft;
 // }
 
 fn main() {
-    println!("hello world");
+    let node_ids = 0..3;
+    let peers: Vec<Peer> = node_ids
+        .clone()
+        .map(|i| Peer {
+            id: i as u64,
+            address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, (3300 + i) as u16),
+        })
+        .collect();
 
-    // &peers
-    //     .clone()
-    //     .into_iter()
-    //     .filter(|p| p.id != i as u64)
-    //     .collect(),
-    // raft_nodes.into_iter().for_each(|r| RaftNode::start(r))
+    let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
+        .clone()
+        .map(|i| {
+            Arc::new(Mutex::new(RaftNode::new(
+                i as u64,
+                peers[i as usize].address,
+            )))
+        })
+        .collect();
+
+    raft_nodes
+        .iter()
+        .for_each(|r| RaftNode::start_server(r.clone()));
+
+    raft_nodes.iter().for_each(|r| {
+        let rid = r.clone().lock().unwrap().id;
+        r.clone().lock().unwrap().set_peers(
+            &peers
+                .clone()
+                .into_iter()
+                .filter(|p| p.id != rid as u64)
+                .collect(),
+        )
+    });
+
+    raft_nodes
+        .iter()
+        .for_each(|r| RaftNode::start_background_tasks(r.clone()));
 }
