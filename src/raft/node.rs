@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 
-use crate::constants::{MAX_TIMEOUT, MESSAGE_LENGTH, MIN_QUORUM, MIN_TIMEOUT};
+use crate::constants::{MAX_TIMEOUT, MESSAGE_LENGTH, MIN_QUORUM, MIN_TIMEOUT, NUM_SERVERS};
 use crate::raft::types::{
     LogEntry, LogIndex, LogTerm, Maintenance, Message, NodeId, Peer, PersistentState, RaftNode,
     Role, VolatileState,
 };
+use std::any::Any;
 
 impl RaftNode {
     pub fn new(id: NodeId, address: SocketAddrV4) -> Self {
@@ -86,38 +87,58 @@ impl RaftNode {
         self.maintenance.peer_nodes = Some(
             peers
                 .iter()
-                .map(|p| (p.id.to_string(), TcpStream::connect(&p.address).unwrap()))
+                .map(|p| (p.id, TcpStream::connect(&p.address).unwrap()))
                 .collect(),
         );
     }
 
     pub fn run_election(&mut self) {
-        // prepare for election
-        self.maintenance.role = Role::Candidate;
-        self.persistent_state.current_term += 1;
+        // Each candidate restarts its randomized election timeout at the start of an election,
+        // and it waits for that timeout to elapse before starting the next election;
+        // this reduces the likelihood of another split vote in the new election.
         self.refresh_timeout();
+
+        // To begin an election, a follower increments its current term and transitions to candidate state.
+        self.persistent_state.current_term += 1;
+        // ...for the same term...
+        let election_term = self.persistent_state.current_term;
+        self.maintenance.role = Role::Candidate;
+        // It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster.
         self.persistent_state.voted_for = Some(self.id);
-
-        // request votes
         let votes = self.send_vote_requests(
-            self.persistent_state.current_term,
+            election_term,
             self.id,
-            // TODO: what's the right thing here
-            0,
-            0,
+            // TODO(max) is this the right way to compute last valid log index
+            // or should it be "last commit index"???
+            self.persistent_state.log.len(),
+            self.persistent_state
+                .log
+                .last()
+                .unwrap_or(&LogEntry {
+                    message: "".to_string(),
+                    term: 0,
+                })
+                .term,
         );
-        // count votes
-        let votes_for = votes.into_iter().filter(|(_term, vote)| *vote).count();
 
-        // if election won
+        // A candidate wins an election if it receives votes from a majority of the servers in the full cluster for the same term.
+        let votes_for = votes
+            .into_iter()
+            .filter(|(term, vote)| *vote && *term == election_term)
+            .count();
         if (votes_for + 1) > *MIN_QUORUM {
             println!(
                 "Server {} has won the election! The new term is: {}",
-                self.id, self.persistent_state.current_term
+                self.id, election_term
             );
+            // Once a candidate wins an election, it becomes leader.
             self.maintenance.role = Role::Leader;
             self.maintenance.next_timeout = None;
+            // It then sends heartbeat messages to all of the other servers to establish its authority and prevent new elections.
             self.send_heartbeat();
+            // When a leader first comes to power, it initializes all nextIndex values to the index just after the last one in its log
+            self.leader_state.as_mut().unwrap().next_index =
+                [self.persistent_state.log.len(); NUM_SERVERS];
         }
     }
 
@@ -138,6 +159,31 @@ impl RaftNode {
             None => false,
         }
     }
+}
+
+impl RaftNode {
+    pub fn service_client_request(&mut self, request: Message) -> Message {
+        let res = Message::ClientResponse {
+            success: false,
+            leader_id: self.maintenance.current_leader.unwrap(),
+        };
+        if self.maintenance.role != Role::Leader {
+            return res;
+        }
+        if let Message::ClientRequest { message } = request {
+            let l = LogEntry {
+                message,
+                term: self.persistent_state.current_term,
+            };
+            self.persistent_state.log.push(l.clone());
+            self.send_append_entries();
+            return Message::ClientResponse {
+                success: true,
+                leader_id: self.maintenance.current_leader.unwrap(),
+            };
+        }
+        res
+    }
 
     pub fn send_vote_requests(
         &self,
@@ -157,7 +203,7 @@ impl RaftNode {
         responses
             .iter()
             .map(|v| match *v {
-                Message::VoteRequestResponse { vote_granted, term } => (term, vote_granted),
+                Message::VoteRequestResponse { term, vote_granted } => (term, vote_granted),
                 _ => panic!(),
             })
             .collect()
@@ -165,23 +211,26 @@ impl RaftNode {
 
     pub fn handle_vote_request(
         self: &mut Self,
-        _term: LogTerm,
-        _candidate_id: NodeId,
-        _last_log_index: LogIndex,
-        _last_log_term: LogTerm,
+        term: LogTerm,
+        candidate_id: NodeId,
+        last_log_index: LogIndex,
+        last_log_term: LogTerm,
     ) -> (LogTerm, bool) {
-        // match self.state.voted_for {
-        //     Some(_) => (term, false),
-        //     None => {
-        //         if term > self.state.current_term {
-        //             self.state.voted_for = Some(candidate_id);
-        //             (term, true)
-        //         } else {
-        //             (term, false)
-        //         }
-        //     }
-        // }
-        todo!()
+        if term < self.persistent_state.current_term {
+            return (self.persistent_state.current_term, false);
+        }
+        if self.persistent_state.voted_for.is_none()
+            || self.persistent_state.voted_for.unwrap() == candidate_id
+        {
+            if let Some(last_log_entry) = self.persistent_state.log.last() {
+                if last_log_entry.term == last_log_term
+                    && self.persistent_state.log.len() - 1 == last_log_index
+                {
+                    return (self.persistent_state.current_term, true);
+                }
+            }
+        }
+        return (self.persistent_state.current_term, false);
     }
 
     fn send_heartbeat(&self) {
@@ -222,25 +271,44 @@ impl RaftNode {
         // }
     }
 
-    fn send_append_entries(&self, entries: Vec<LogEntry>) -> Vec<Message> {
-        let rpc_message = Message::AppendEntriesRequest {
-            term: self.persistent_state.current_term,
-            leader_id: self.id,
-            // TODO: is this the right index and term???
-            // This is definitely wrong
-            prev_log_index: self.volatile_state.commit_index,
-            prev_log_term: self.persistent_state.current_term,
-            entries,
-            leader_commit: self.volatile_state.commit_index,
-        };
-        let rpc_responses = self.send(rpc_message);
-        rpc_responses
-            .into_iter()
-            .map(|x| match x {
-                Message::AppendEntriesResponse { .. } => x,
-                _ => panic!(),
-            })
-            .collect()
+    // TODO retries here if nodes go down?
+    fn send_append_entries(&mut self) {
+        let mut term = self.persistent_state.current_term;
+        for (id, mut stream) in self.maintenance.peer_nodes.as_ref().unwrap() {
+            let mut next_indicies = self.leader_state.as_mut().unwrap().next_index;
+            'inner: while let Some(&prev_log_index) = next_indicies.get(*id as usize) {
+                let prev_log_term = self.persistent_state.log[prev_log_index].term;
+                let entries = self.persistent_state.log[prev_log_index + 1..].to_vec();
+                let rpc_message = Message::AppendEntriesRequest {
+                    term,
+                    leader_id: self.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit: self.volatile_state.commit_index,
+                };
+                stream
+                    .write(&bincode::serialize(&rpc_message).unwrap())
+                    .unwrap();
+
+                let mut buffer = [0; MESSAGE_LENGTH];
+                stream.read(&mut buffer).unwrap();
+                match bincode::deserialize(&buffer).unwrap() {
+                    // consistency check passes -> break while
+                    Message::AppendEntriesResponse { success, .. } if success => break 'inner,
+                    // consistency check passes -> decrement prev_log_index
+                    Message::AppendEntriesResponse { success, .. } if !success => {
+                        // After a rejection, the leader decrements nextIndex and retries the AppendEntries RPC.
+                        // Eventually nextIndex will reach a point where the leader and follower logs match.
+                        if prev_log_index == 0 {
+                            panic!()
+                        }
+                        next_indicies[*id as usize] -= 1;
+                    }
+                    _ => panic!(),
+                };
+            }
+        }
     }
 
     pub fn handele_append_entries(
@@ -253,13 +321,13 @@ impl RaftNode {
         leader_commit: LogIndex,
     ) -> (LogTerm, bool) {
         if term < self.persistent_state.current_term {
-            return (term, false);
+            return (self.persistent_state.current_term, false);
         }
 
         if self.persistent_state.log.get(prev_log_index).is_none()
             || self.persistent_state.log.get(prev_log_index).unwrap().term != prev_log_term
         {
-            return (term, false);
+            return (self.persistent_state.current_term, false);
         }
 
         let matching_entries: Vec<LogEntry> = self.persistent_state.log[(prev_log_index + 1)..]
@@ -277,7 +345,10 @@ impl RaftNode {
             self.volatile_state.commit_index = min(leader_commit, prev_log_index + num_new_entries);
         }
 
+        // If the leader’s term (included in its RPC) is at least as large as the candidate’s current term,
+        // then the candidate recognizes the leader as legitimate and returns to follower state.
         self.maintenance.current_leader = Some(leader_id);
+        self.maintenance.role = Role::Follower;
         (self.persistent_state.current_term, true)
     }
 }
@@ -334,12 +405,13 @@ impl RaftNode {
         }
     }
 
+    // TODO: this should be done in parallel but i'm running into self being captured
     fn send(&self, rpc_message: Message) -> Vec<Message> {
-        let request_vote_bin = bincode::serialize(&rpc_message).unwrap();
+        let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
         let mut rpc_responses: Vec<Message> = Vec::new();
 
         for mut stream in self.maintenance.peer_nodes.as_ref().unwrap().values() {
-            stream.write(&request_vote_bin).unwrap();
+            stream.write(&rpc_message_bin).unwrap();
 
             let mut buffer = [0; MESSAGE_LENGTH];
             stream.read(&mut buffer).unwrap();
@@ -395,7 +467,7 @@ mod tests {
         let mut connections: HashMap<String, HashSet<String>> = HashMap::new();
         for raft_node in &raft_nodes {
             let address = raft_node.lock().as_ref().unwrap().address;
-            for (ip_address, connection) in raft_node
+            for (_ip_address, connection) in raft_node
                 .lock()
                 .as_ref()
                 .unwrap()

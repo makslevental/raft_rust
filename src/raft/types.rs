@@ -48,7 +48,7 @@ pub struct Maintenance {
     pub current_leader: Option<NodeId>,
     pub role: Role,
     pub next_timeout: Option<Instant>,
-    pub peer_nodes: Option<HashMap<String, TcpStream>>,
+    pub peer_nodes: Option<HashMap<NodeId, TcpStream>>,
 }
 
 #[derive(Debug)]
@@ -92,6 +92,13 @@ pub enum Message {
     HeartbeatResponse {
         success: bool,
         node_id: NodeId,
+    },
+    ClientRequest {
+        message: String,
+    },
+    ClientResponse {
+        success: bool,
+        leader_id: NodeId,
     },
 }
 
