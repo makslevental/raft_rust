@@ -1,8 +1,8 @@
 use math::round;
 
 pub const NUM_SERVERS: usize = 3;
-pub const MIN_TIMEOUT: usize = 15;
-pub const MAX_TIMEOUT: usize = 30;
+pub const MIN_TIMEOUT: usize = 150;
+pub const MAX_TIMEOUT: usize = 300;
 pub const MESSAGE_LENGTH: usize = 1024;
 
 lazy_static! {

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{SocketAddrV4, TcpStream};
 
 use std::time::Instant;
@@ -6,9 +5,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::NUM_SERVERS;
+use std::collections::HashMap;
 
-pub type LogTerm = u64;
-pub type NodeId = u64;
+pub type LogTerm = usize;
+pub type NodeId = usize;
 pub type LogIndex = usize;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -39,16 +39,9 @@ pub struct VolatileState {
 
 #[derive(Debug)]
 pub struct LeaderState {
-    pub next_index: [LogIndex; NUM_SERVERS],
-    pub match_index: [LogIndex; NUM_SERVERS],
-}
-
-#[derive(Debug)]
-pub struct Maintenance {
-    pub current_leader: Option<NodeId>,
-    pub role: Role,
-    pub next_timeout: Option<Instant>,
-    pub peer_nodes: Option<HashMap<NodeId, TcpStream>>,
+    pub next_index: HashMap<NodeId, LogIndex>,
+    pub match_index: HashMap<NodeId, LogIndex>,
+    pub votes: HashMap<NodeId, VoteRequestResponse>,
 }
 
 #[derive(Debug)]
@@ -56,54 +49,101 @@ pub struct RaftNode {
     pub persistent_state: PersistentState,
     pub volatile_state: VolatileState,
     pub leader_state: Option<LeaderState>,
-    pub maintenance: Maintenance,
+
+    //
+    pub current_leader: Option<NodeId>,
+    pub role: Role,
+    pub next_timeout: Option<Instant>,
     pub id: NodeId,
     pub address: SocketAddrV4,
+    pub peers: HashMap<NodeId, Peer>,
+    pub start_time: Instant,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct VoteRequest {
+    pub term: LogTerm,
+    pub candidate_id: NodeId,
+    pub last_log_index: LogIndex,
+    pub last_log_term: LogTerm,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct VoteRequestResponse {
+    pub node_id: NodeId,
+    pub term: LogTerm,
+    pub vote_granted: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppendEntriesRequest {
+    pub term: LogTerm,
+    pub leader_id: NodeId,
+    pub prev_log_index: LogIndex,
+    pub prev_log_term: LogTerm,
+    pub entries: Vec<LogEntry>,
+    pub leader_commit: LogIndex,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct AppendEntriesResponse {
+    pub node_id: NodeId,
+    pub term: LogTerm,
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct Heartbeat {
+    pub term: LogTerm,
+    pub node_id: NodeId,
+    pub leader_commit: LogIndex,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct HeartbeatResponse {
+    pub success: bool,
+    pub node_id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClientRequest {
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct ClientResponse {
+    pub success: bool,
+    pub leader_id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct Ping {
+    pub pinger_id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct PingResponse {
+    pub pinger_id: NodeId,
+    pub ponger_id: NodeId,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message {
-    VoteRequest {
-        term: LogTerm,
-        candidate_id: NodeId,
-        last_log_index: LogIndex,
-        last_log_term: LogTerm,
-    },
-    VoteRequestResponse {
-        term: LogTerm,
-        vote_granted: bool,
-    },
-    AppendEntriesRequest {
-        term: LogTerm,
-        leader_id: NodeId,
-        prev_log_index: LogIndex,
-        prev_log_term: LogTerm,
-        entries: Vec<LogEntry>,
-        leader_commit: LogIndex,
-    },
-    AppendEntriesResponse {
-        term: LogTerm,
-        success: bool,
-    },
-    Heartbeat {
-        term: LogTerm,
-        node_id: NodeId,
-    },
-    HeartbeatResponse {
-        success: bool,
-        node_id: NodeId,
-    },
-    ClientRequest {
-        message: String,
-    },
-    ClientResponse {
-        success: bool,
-        leader_id: NodeId,
-    },
+    V(VoteRequest),
+    VR(VoteRequestResponse),
+    A(AppendEntriesRequest),
+    AR(AppendEntriesResponse),
+    H(Heartbeat),
+    HR(HeartbeatResponse),
+    C(ClientRequest),
+    CR(ClientResponse),
+    P(Ping),
+    PR(PingResponse),
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug)]
 pub struct Peer {
     pub id: NodeId,
     pub address: SocketAddrV4,
+    pub connection: Option<TcpStream>,
 }
