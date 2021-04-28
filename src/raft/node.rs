@@ -1,24 +1,26 @@
 use crossbeam_utils::thread as crossbeam_thread;
-use velcro::{hash_map, iter, vec};
-
+use log::{debug, info, warn};
 use std::convert::TryInto;
+use std::io::{self, BufRead};
 use std::io::{Read, Write};
-use std::net::{SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddrV4, TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+use velcro::{hash_map, iter, vec};
 
 use rand::Rng;
 
-use crate::constants::{MAX_TIMEOUT, MESSAGE_LENGTH, MIN_QUORUM, MIN_TIMEOUT, NUM_SERVERS};
 use crate::raft::types::{
-    AppendEntriesRequest, Heartbeat, LeaderState, LogEntry, LogIndex, LogTerm, Message, NodeId,
-    Peer, PersistentState, Ping, PingResponse, RaftNode, Role, VolatileState, VoteRequest,
+    AppendEntriesRequest, CRCMessage, Heartbeat, LeaderState, LogEntry, LogIndex, LogTerm, Message,
+    NodeId, Peer, PersistentState, Ping, PingResponse, RaftNode, Role, VolatileState, VoteRequest,
     VoteRequestResponse,
 };
 
 use serde::Serialize;
 
+use crate::constants::MESSAGE_LENGTH;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -26,8 +28,15 @@ use std::iter::FromIterator;
 use std::thread::JoinHandle;
 
 impl RaftNode {
-    pub fn new(id: NodeId, address: SocketAddrV4, peers: Vec<(NodeId, SocketAddrV4)>) -> Self {
-        RaftNode {
+    pub fn new(
+        id: NodeId,
+        address: SocketAddrV4,
+        peers: Vec<(NodeId, SocketAddrV4)>,
+        MAJORITY: usize,
+        MIN_TIMEOUT: usize,
+        MAX_TIMEOUT: usize,
+    ) -> Self {
+        let mut r = RaftNode {
             persistent_state: PersistentState {
                 current_term: 0,
                 voted_for: None,
@@ -61,64 +70,23 @@ impl RaftNode {
                 .collect(),
             id,
             address,
-            start_time: Instant::now(),
-        }
-    }
-
-    pub fn start_background_tasks(this: Arc<Mutex<Self>>) -> JoinHandle<()> {
-        let this_clone = Arc::clone(&this);
-        this_clone.lock().unwrap().refresh_timeout();
-        thread::spawn(move || loop {
-            let mut this_node = this_clone.lock().unwrap();
-            // broadcast heartbeat if leader
-            if this_node.role == Role::Leader {
-                this_node.send_heartbeat();
-            } else if this_node.has_timed_out() {
-                // not leader therefore check time out and run election
-                this_node.start_election();
-            }
-
-            thread::sleep(Duration::from_nanos(5));
-
-            // TODO: remove and use channels instead
-            if Instant::now().duration_since(this_node.start_time) > Duration::from_secs(5) {
-                break;
-            }
-        })
-    }
-
-    pub fn start_server(this: Arc<Mutex<Self>>) {
-        let address;
-        {
-            address = Arc::clone(&this).lock().unwrap().address;
-        }
-        println!("Starting server at: {}...", address);
-        let listener = TcpListener::bind(address).unwrap();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                println!("{:?} connected to {:?}", this.lock().unwrap().id, stream);
-                let this = this.clone();
-                match stream {
-                    Ok(stream) => {
-                        thread::spawn(move || Self::handle_connection(this, stream));
-                    }
-                    Err(e) => {
-                        println!("Error while listening to client: {}", e);
-                    }
-                }
-            }
-        });
+            MAJORITY,
+            MIN_TIMEOUT,
+            MAX_TIMEOUT,
+        };
+        r.refresh_timeout();
+        r
     }
 
     pub fn connect_to_peers(&mut self) {
-        println!("{:?} connecting to peers {:?}", self.id, self.peers);
+        debug!("node {:?} connecting to peers {:?}", self.id, self.peers);
         for (_pid, mut peer) in self.peers.iter_mut() {
             peer.connection = Some(TcpStream::connect(peer.address).unwrap());
         }
     }
 
     pub fn start_election(&mut self) {
-        println!("{:?} starting election", self.id);
+        debug!("node {:?} starting election", self.id);
         // Each candidate restarts its randomized election timeout at the start of an election,
         // and it waits for that timeout to elapse before starting the next election;
         // this reduces the likelihood of another split vote in the new election.
@@ -130,7 +98,7 @@ impl RaftNode {
         // ...for the same term...
         let election_term = self.persistent_state.current_term;
         self.role = Role::Candidate;
-        self.leader_state = Option::from(LeaderState {
+        self.leader_state = Some(LeaderState {
             next_index: Default::default(),
             match_index: Default::default(),
             votes: hash_map! {
@@ -148,10 +116,12 @@ impl RaftNode {
 
     pub fn refresh_timeout(&mut self) {
         let mut rng = rand::thread_rng();
-        self.next_timeout = Option::from(
+        self.next_timeout = Some(
             Instant::now()
                 + Duration::from_millis(
-                    rng.gen_range(MIN_TIMEOUT..MAX_TIMEOUT).try_into().unwrap(),
+                    rng.gen_range(self.MIN_TIMEOUT..self.MAX_TIMEOUT)
+                        .try_into()
+                        .unwrap(),
                 ),
         );
     }
@@ -175,19 +145,27 @@ impl RaftNode {
         self.send_to_all_peers(message)
     }
 
+    // Current terms are exchanged whenever servers communicate; if one server’s current term is
+    // smaller than the other’s, then it updates its current term to the larger value.
+    // If a candidate or leader discovers that its term is out of date, it immediately reverts to
+    // fol- lower state. If a server receives a request with a stale term number, it rejects the request.
+
     pub fn handle_vote_request(&mut self, vr: VoteRequest) -> VoteRequestResponse {
-        println!("{:?} received vote request {:?}", self.id, vr);
+        debug!("node {:?} received vote request {:?}", self.id, vr);
+
         if self.persistent_state.current_term < vr.term {
-            self.convert_to_follower(vr.term);
+            // switch to follower but not necessarily follow this node
+            self.convert_to_follower(vr.term, Some(vr.candidate_id));
         }
 
-        if vr.term < self.persistent_state.current_term {
+        if self.persistent_state.current_term > vr.term {
             return VoteRequestResponse {
                 node_id: self.id,
                 term: self.persistent_state.current_term,
                 vote_granted: false,
             };
         }
+
         if self.persistent_state.voted_for.is_none()
             || self.persistent_state.voted_for.unwrap() == vr.candidate_id
         {
@@ -210,21 +188,29 @@ impl RaftNode {
     }
 
     pub fn handle_vote_request_response(&mut self, vrr: VoteRequestResponse) {
-        println!("{:?} received vote request response {:?}", self.id, vrr);
-        // // A candidate wins an election if it receives votes from a majority of the servers in the full cluster for the same term.
+        debug!(
+            "node {:?} received vote request response {:?}",
+            self.id, vrr
+        );
+
+        if self.persistent_state.current_term < vrr.term {
+            self.convert_to_follower(vrr.term, Some(vrr.node_id));
+            return;
+        }
+
         let current_term = self.persistent_state.current_term;
-        // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-        if current_term < vrr.term {
-            self.convert_to_follower(vrr.term);
+
+        if self.role == Role::Leader {
+            // thanks but i'm already popular
             return;
         }
 
         // TODO: not sure how this happens but i'm getting spurious
         // vote requests and vote request responses being received (but never sent)
-        // i suspect serialization bug
-        if self.leader_state.is_none() {
-            return;
-        }
+        // i suspect serialization bug (something as usize and u64)
+        // if self.leader_state.is_none() {
+        //     return;
+        // }
 
         self.leader_state
             .as_mut()
@@ -239,14 +225,14 @@ impl RaftNode {
             .iter()
             .filter(|(_, v)| v.vote_granted && v.term == current_term)
             .count();
-        println!(
-            "{:?} got {:?} votes for; min votes {:?}",
-            self.id, votes_for, *MIN_QUORUM
+        debug!(
+            "node {:?} got {:?} votes for; min votes {:?}",
+            self.id, votes_for, self.MAJORITY
         );
         // no +1 since we included the vote for ourselves in the votes map
-        if (votes_for) > *MIN_QUORUM {
-            println!(
-                "Server {} has won the election! The new term is: {}",
+        if (votes_for) >= self.MAJORITY {
+            debug!(
+                "node {} has won the election! The new term is: {}",
                 self.id, current_term
             );
             // Once a candidate wins an election, it becomes leader.
@@ -300,19 +286,28 @@ impl RaftNode {
     }
 
     pub fn handle_heartbeat(&mut self, heartbeat: Heartbeat) {
-        println!(
-            "Server {} with term {}, received heartbeat from {} with term {}",
+        debug!(
+            "node {} with term {}, received heartbeat from {} with term {}",
             self.id, self.persistent_state.current_term, heartbeat.node_id, heartbeat.term
         );
 
-        // is it geq?
-        if heartbeat.term >= self.persistent_state.current_term {
-            println!(
-                "Server {} becoming follower. The new leader is: {}",
+        // old leader
+        if self.persistent_state.current_term == heartbeat.term
+            && self.current_leader.unwrap_or(u64::MAX) == heartbeat.node_id
+        {
+            self.refresh_timeout();
+            return;
+        }
+
+        // new leader
+        if heartbeat.term > self.persistent_state.current_term
+            && self.persistent_state.voted_for.unwrap_or(u64::MAX) == heartbeat.node_id
+        {
+            debug!(
+                "node {} becoming follower. The new leader is: {}",
                 self.id, heartbeat.node_id
             );
-            self.convert_to_follower(heartbeat.term);
-            self.refresh_timeout();
+            self.convert_to_follower(heartbeat.term, Some(heartbeat.node_id));
 
             // If leaderCommit > commitIndex, set commitIndex =
             // min(leaderCommit, index of last new entry)
@@ -321,12 +316,12 @@ impl RaftNode {
                     min(heartbeat.leader_commit, self.get_last_log_index())
             }
 
+            // TODO
             // If the leader’s term (included in its RPC) is at least as large as the candidate’s current term,
             // then the candidate recognizes the leader as legitimate and returns to follower state.
-            self.current_leader = Some(heartbeat.node_id);
         }
     }
-    //
+
     // // TODO retries here if nodes go down?
     // fn send_append_entries(&mut self) {
     //     let term = self.persistent_state.current_term;
@@ -426,12 +421,12 @@ impl RaftNode {
     //     };
     // }
     pub fn ping_all_peers(&mut self) {
-        println!("{:?} sending ping to all peers", self.id);
+        debug!("node {:?} sending ping to all peers", self.id);
         self.send_to_all_peers(Message::P(Ping { pinger_id: self.id }))
     }
 
     pub fn handle_ping(&mut self, p: Ping) -> PingResponse {
-        println!("{:?} handling ping {:?}", self.id, p);
+        debug!("node {:?} handling ping {:?}", self.id, p);
         PingResponse {
             pinger_id: p.pinger_id,
             ponger_id: self.id,
@@ -439,7 +434,7 @@ impl RaftNode {
     }
 
     pub fn handle_ping_response(&mut self, pr: PingResponse) {
-        println!("node {:?} got ping response {:?}", self.id, pr);
+        debug!("node {:?} got ping response {:?}", self.id, pr);
         assert_eq!(pr.pinger_id, self.id);
         self.persistent_state.log.push(LogEntry {
             message: format!("{}", pr.ponger_id),
@@ -449,35 +444,136 @@ impl RaftNode {
 }
 
 impl RaftNode {
+    pub fn start_background_tasks(this: Arc<Mutex<Self>>) -> (JoinHandle<()>, Sender<()>) {
+        let (tx, rx) = mpsc::channel();
+        let this_clone = this.clone();
+        let handle = thread::spawn(move || loop {
+            let mut rng = rand::thread_rng();
+
+            // TODO: becareful about holding locks for too long!!!
+
+            // broadcast heartbeat if leader
+            {
+                let mut this_node = this_clone.lock().unwrap();
+                if this_node.has_timed_out() {
+                    // not leader therefore check time out and run election
+                    this_node.start_election();
+                }
+            }
+
+            {
+                // "work" -> will become append entries or service client request
+                thread::sleep(Duration::from_millis(
+                    rng.gen_range(15..30).try_into().unwrap(),
+                ));
+            }
+
+            {
+                let mut this_node = this_clone.lock().unwrap();
+                if this_node.role == Role::Leader {
+                    this_node.send_heartbeat();
+                }
+            }
+
+            {
+                let this_node = this_clone.lock().unwrap();
+                match rx.try_recv() {
+                    Ok(_) | Err(TryRecvError::Disconnected) => {
+                        debug!("node {:?} terminating background tasks", this_node.id);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+        });
+        (handle, tx)
+    }
+
+    pub fn start_server(this: Arc<Mutex<Self>>) -> (JoinHandle<()>, Sender<()>) {
+        let address = this.lock().unwrap().address;
+        debug!("Starting server at: {}...", address);
+
+        let listener = TcpListener::bind(address).unwrap();
+        // https://stackoverflow.com/a/56693740/9045206
+        listener
+            .set_nonblocking(true)
+            .expect("Cannot set non-blocking");
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        debug!(
+                            "node {:?} connected to {:?}",
+                            this.lock().unwrap().id,
+                            stream
+                        );
+                        // listener should be nonblocking but not stream
+                        stream.set_nonblocking(false);
+                        let this = this.clone();
+                        thread::spawn(move || Self::handle_connection(this, stream));
+                    }
+                    Err(err) => {
+                        if err.kind() != io::ErrorKind::WouldBlock {
+                            println!("leaving loop, error: {}", err);
+                            break;
+                        }
+                    }
+                }
+
+                match rx.try_recv() {
+                    Ok(_) | Err(TryRecvError::Disconnected) => {
+                        debug!(
+                            "node {:?} terminating handle connection",
+                            this.lock().unwrap().id
+                        );
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                };
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        (handle, tx)
+    }
     fn handle_connection(this: Arc<Mutex<Self>>, mut peer_stream: TcpStream) {
         let node_id = this.lock().unwrap().id;
-        println!(
-            "{:?} handling connection {:?}",
+        debug!(
+            "node {:?} handling connection {:?}",
             node_id,
             peer_stream.peer_addr()
         );
         loop {
             let mut buffer = [0; MESSAGE_LENGTH];
             peer_stream.read(&mut buffer).unwrap();
-            let m = bincode::deserialize(&buffer).unwrap();
-            println!(
+            let m: CRCMessage = bincode::deserialize(&buffer).unwrap();
+            if !m.check_crc() {
+                debug!("crc failed for {:?}", m);
+                continue;
+            }
+            let m = m.msg;
+            debug!(
                 "node {:?} received message {:?} from node {:?}",
                 node_id,
                 m,
                 peer_stream.peer_addr(),
             );
+
+            // TODO: moving this down from above let the other nodes catch up
+            // i'm guessing continue doesn't drop the lock or something?
             let mut this = this.lock().unwrap();
             match m {
                 Message::P(p) => {
                     let pr = Message::PR(this.handle_ping(p));
-                    this.send(p.pinger_id, &pr);
+                    this.send(p.pinger_id, pr);
                 }
                 Message::PR(pr) => {
                     this.handle_ping_response(pr);
                 }
                 Message::V(v) => {
                     let vrr = Message::VR(this.handle_vote_request(v));
-                    this.send(v.candidate_id, &vrr);
+                    this.send(v.candidate_id, vrr);
                 }
                 Message::VR(vr) => {
                     this.handle_vote_request_response(vr);
@@ -490,21 +586,19 @@ impl RaftNode {
                     this.handle_heartbeat(h);
                 }
                 _ => {
-                    println!("how did we get this {:?}", m);
+                    debug!("how did we get this {:?}", m);
                     panic!()
                 }
             };
-
-            thread::sleep(Duration::from_nanos(5));
         }
     }
 
-    fn send<T: Serialize + Debug>(&mut self, node_id: NodeId, rpc_message: &T) {
+    fn send(&mut self, node_id: NodeId, message: Message) {
         // TODO: not sure where this is coming from
         // but i'm getting vote requests from overflow ids
-        if !self.peers.contains_key(&node_id) {
-            return;
-        }
+        // if !self.peers.contains_key(&node_id) {
+        //     return;
+        // }
         let mut peer_stream = self
             .peers
             .get_mut(&node_id)
@@ -512,35 +606,37 @@ impl RaftNode {
             .connection
             .as_mut()
             .unwrap();
-        println!(
-            "{:?} sending message {:?} to {:?}",
-            peer_stream.local_addr(),
-            rpc_message,
+        debug!(
+            "node {:?} sending message {:?} to {:?}",
+            self.id,
+            message,
             peer_stream.peer_addr()
         );
-        let rpc_message_bin = bincode::serialize(rpc_message).unwrap();
+        let rpc_message = CRCMessage::new(message);
+        let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
         peer_stream.write(&rpc_message_bin).unwrap();
         peer_stream.flush().unwrap();
     }
 
-    fn send_to_all_peers<T: Serialize + Send + Sync + Debug + Clone>(&mut self, rpc_message: T) {
-        println!(
-            "{:?} sending message {:?} to all peers",
-            self.id, rpc_message
+    fn send_to_all_peers(&mut self, message: Message) {
+        debug!(
+            "node {:?} sending message {:?} to all peers",
+            self.id, message
         );
+        let self_id = self.id;
         crossbeam_thread::scope(|scope| {
             self.peers.iter_mut().for_each(|(_, peer)| {
-                let rpc_message = rpc_message.clone();
+                let message = message.clone();
                 let mut peer_stream = peer.connection.as_mut().unwrap();
-                println!(
-                    "{:?} sending message {:?} to {:?}",
-                    peer_stream.local_addr(),
-                    rpc_message,
-                    peer_stream.peer_addr()
-                );
-                let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
-
                 scope.spawn(move |_| {
+                    debug!(
+                        "node {:?} sending message {:?} to {:?}",
+                        self_id,
+                        message,
+                        peer_stream.peer_addr()
+                    );
+                    let rpc_message = CRCMessage::new(message);
+                    let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
                     peer_stream.write(&rpc_message_bin).unwrap();
                     peer_stream.flush().unwrap();
                 });
@@ -552,66 +648,75 @@ impl RaftNode {
 
 impl RaftNode {
     fn get_last_log_index(&self) -> LogIndex {
-        self.persistent_state.log.len() - 1
+        (self.persistent_state.log.len() - 1) as u64
     }
 
     fn get_last_log_term(&self) -> LogTerm {
-        self.persistent_state.log[self.get_last_log_index()].term
+        self.persistent_state.log[self.get_last_log_index() as usize].term
     }
 
-    fn convert_to_follower(&mut self, term: LogTerm) {
+    fn convert_to_follower(&mut self, term: LogTerm, leader_id: Option<NodeId>) {
         self.role = Role::Follower;
         self.leader_state = None;
         self.persistent_state.current_term = term;
-        // who do i follow if term T > currentTerm
-        // self.current_leader = Some(leader_id);
+        // TODO who do i follow if term T > currentTerm
+        self.current_leader = leader_id;
         self.persistent_state.voted_for = None;
+        self.refresh_timeout();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::raft::types::{LogTerm, NodeId, RaftNode, Role};
+    use simple_logger::SimpleLogger;
     use std::cmp::max;
     use std::collections::{HashMap, HashSet};
     use std::error::Error;
     use std::iter::FromIterator;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::thread::JoinHandle;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const RAFT_ELECTION_GRACE_PERIOD: u64 = 1;
 
-    fn build_raft_nodes(num_servers: usize) -> Vec<Arc<Mutex<RaftNode>>> {
+    fn build_raft_nodes(
+        num_servers: usize,
+        MAJORITY: usize,
+        MIN_TIMEOUT: usize,
+        MAX_TIMEOUT: usize,
+    ) -> Vec<Arc<Mutex<RaftNode>>> {
         let node_ids = 0..num_servers;
         let nodes: Vec<(NodeId, SocketAddrV4)> = node_ids
             .clone()
-            .map(|i| (i, SocketAddrV4::new(Ipv4Addr::LOCALHOST, (3300 + i) as u16)))
+            .map(|i| {
+                (
+                    i as u64,
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, (3300 + i) as u16),
+                )
+            })
             .collect();
         let raft_nodes: Vec<Arc<Mutex<RaftNode>>> = node_ids
             .clone()
             .map(|i| {
                 Arc::new(Mutex::new(RaftNode::new(
-                    i,
+                    i as u64,
                     nodes[i as usize].1,
                     nodes
                         .clone()
                         .into_iter()
-                        .filter(|(pid, _address)| *pid != i)
+                        .filter(|(pid, _address)| *pid != i as u64)
                         .collect(),
+                    MAJORITY,
+                    MIN_TIMEOUT,
+                    MAX_TIMEOUT,
                 )))
             })
             .collect();
 
-        for raft_node in raft_nodes.iter() {
-            RaftNode::start_server(raft_node.clone());
-        }
-
-        for raft_node in raft_nodes.iter() {
-            raft_node.lock().unwrap().connect_to_peers();
-        }
         raft_nodes
     }
 
@@ -636,11 +741,7 @@ mod tests {
             let mut last_term_with_leader = 0;
             for (term, leaders) in &leaders {
                 if leaders.len() > 1 {
-                    return Err(format!(
-                        "term {:?} has {:?} (>1) leaders",
-                        term,
-                        leaders.len()
-                    ));
+                    return Err(format!("term {:?} has (>1) leaders: {:?}", term, leaders));
                 }
                 last_term_with_leader = max(last_term_with_leader, *term);
             }
@@ -669,8 +770,20 @@ mod tests {
 
     #[test]
     fn test_ping_ping() {
+        SimpleLogger::new().init().unwrap();
+
         let num_servers: usize = 10;
-        let raft_nodes = build_raft_nodes(num_servers);
+        let raft_nodes = build_raft_nodes(num_servers, 6, 150, 300);
+        let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+            .iter()
+            .map(|r| RaftNode::start_server(r.clone()))
+            .collect();
+
+        for raft_node in raft_nodes.iter() {
+            raft_node.lock().unwrap().connect_to_peers();
+        }
+        // TODO: make sure to let all connections come online
+        thread::sleep(Duration::from_secs(5));
 
         for raft_node in raft_nodes.iter() {
             raft_node.lock().unwrap().ping_all_peers();
@@ -679,12 +792,12 @@ mod tests {
         thread::sleep(Duration::from_secs(5));
 
         for raft_node in raft_nodes.iter() {
-            let ping_ponged_peers: HashSet<usize> = HashSet::from_iter(
+            let ping_ponged_peers: HashSet<u64> = HashSet::from_iter(
                 raft_node.lock().unwrap().persistent_state.log[1..]
                     .iter()
                     .map(|le| le.message.parse().unwrap()),
             );
-            let all_peers: HashSet<usize> = HashSet::from_iter(
+            let all_peers: HashSet<_> = HashSet::from_iter(
                 raft_node
                     .lock()
                     .unwrap()
@@ -697,33 +810,125 @@ mod tests {
     }
 
     #[test]
-    fn test_initial_election_2a() {
-        let num_servers: usize = 3;
-        let raft_nodes = build_raft_nodes(num_servers);
+    fn test_rigged_election() {
+        SimpleLogger::new().init().unwrap();
 
-        let mut handles: Vec<JoinHandle<()>> = vec![];
-        for raft_node in &raft_nodes {
-            let handle = RaftNode::start_background_tasks(raft_node.clone());
-            handles.push(handle);
+        for num_servers in 3..10 {
+            for _ in 0..10 {
+                let majority = if num_servers % 2 == 1 {
+                    (num_servers + 1) / 2
+                } else {
+                    num_servers / 2 + 1
+                };
+                let raft_nodes = build_raft_nodes(num_servers, majority, 150, 300);
+                let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                    .iter()
+                    .map(|r| RaftNode::start_server(r.clone()))
+                    .collect();
+
+                for raft_node in raft_nodes.iter() {
+                    raft_node.lock().unwrap().connect_to_peers();
+                }
+
+                for raft_node in &raft_nodes[1..] {
+                    let id = raft_node.lock().unwrap().id;
+                    raft_node.lock().unwrap().next_timeout = None;
+                }
+
+                let background_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                    .iter()
+                    .map(|r| RaftNode::start_background_tasks(r.clone()))
+                    .collect();
+
+                println!("start tests with {:?} nodes", num_servers);
+
+                thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+                let leader = check_one_leader(&raft_nodes);
+                assert!(leader.is_ok(), format!("{:?}", leader));
+                assert_eq!(leader.unwrap(), 0);
+
+                thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+                let term1 = check_terms(&raft_nodes);
+                thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+                let term2 = check_terms(&raft_nodes);
+                assert!(term2.is_ok());
+                assert_eq!(term1, term2);
+
+                let leader = check_one_leader(&raft_nodes);
+                assert!(leader.is_ok(), format!("{:?}", leader));
+                assert_eq!(leader.unwrap(), 0);
+
+                println!("tests with {:?} nodes successfully completed", num_servers);
+
+                for (handle, tx) in background_handles {
+                    tx.send(());
+                    handle.join().unwrap();
+                }
+
+                for (handle, tx) in server_handles {
+                    tx.send(());
+                    handle.join().unwrap();
+                }
+
+                thread::sleep(Duration::from_millis(10));
+            }
         }
+    }
 
-        println!("start tests");
+    #[test]
+    fn test_initial_election_2a() {
+        SimpleLogger::new().init().unwrap();
 
-        thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
-        let leader = check_one_leader(&raft_nodes);
-        assert!(leader.is_ok(), format!("{:?}", leader));
-        thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
-        let term1 = check_terms(&raft_nodes);
-        thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
-        let term2 = check_terms(&raft_nodes);
-        assert!(term2.is_ok());
+        for num_servers in 3..10 {
+            for _ in 0..10 {
+                let majority = if num_servers % 2 == 1 {
+                    (num_servers + 1) / 2
+                } else {
+                    num_servers / 2 + 1
+                };
+                let raft_nodes = build_raft_nodes(num_servers, majority, 150, 300);
 
-        assert_eq!(term1, term2);
+                let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                    .iter()
+                    .map(|r| RaftNode::start_server(r.clone()))
+                    .collect();
 
-        println!("tests successfully completed");
+                for raft_node in raft_nodes.iter() {
+                    raft_node.lock().unwrap().connect_to_peers();
+                }
 
-        for handle in handles {
-            handle.join().unwrap();
+                let background_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                    .iter()
+                    .map(|r| RaftNode::start_background_tasks(r.clone()))
+                    .collect();
+
+                println!("start tests with {:?} nodes", num_servers);
+                thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+                let leader = check_one_leader(&raft_nodes);
+                assert!(leader.is_ok(), format!("{:?}", leader));
+                thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+                let term1 = check_terms(&raft_nodes);
+                thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+                let term2 = check_terms(&raft_nodes);
+                assert!(term2.is_ok());
+                assert_eq!(term1, term2);
+
+                println!("tests with {:?} nodes successfully completed", num_servers);
+
+                for (handle, tx) in background_handles {
+                    tx.send(());
+                    handle.join().unwrap();
+                }
+
+                for (handle, tx) in server_handles {
+                    tx.send(());
+                    handle.join().unwrap();
+                }
+
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }

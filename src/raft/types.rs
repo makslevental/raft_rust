@@ -1,5 +1,6 @@
 use std::net::{SocketAddrV4, TcpStream};
 
+use crc32fast::Hasher;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -7,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::constants::NUM_SERVERS;
 use std::collections::HashMap;
 
-pub type LogTerm = usize;
-pub type NodeId = usize;
-pub type LogIndex = usize;
+pub type LogTerm = u64;
+pub type NodeId = u64;
+pub type LogIndex = u64;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -57,7 +58,9 @@ pub struct RaftNode {
     pub id: NodeId,
     pub address: SocketAddrV4,
     pub peers: HashMap<NodeId, Peer>,
-    pub start_time: Instant,
+    pub MAJORITY: usize,
+    pub MIN_TIMEOUT: usize,
+    pub MAX_TIMEOUT: usize,
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
@@ -139,6 +142,30 @@ pub enum Message {
     CR(ClientResponse),
     P(Ping),
     PR(PingResponse),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CRCMessage {
+    pub msg: Message,
+    crc: u32,
+}
+
+impl CRCMessage {
+    pub fn new(msg: Message) -> Self {
+        let message_bin = bincode::serialize(&msg).unwrap();
+        let mut hasher = Hasher::new();
+        hasher.update(message_bin.as_ref());
+        let checksum = hasher.finalize();
+        CRCMessage { msg, crc: checksum }
+    }
+
+    pub fn check_crc(&self) -> bool {
+        let message_bin = bincode::serialize(&self.msg).unwrap();
+        let mut hasher = Hasher::new();
+        hasher.update(message_bin.as_ref());
+        let checksum = hasher.finalize();
+        return checksum == self.crc;
+    }
 }
 
 #[derive(Debug)]

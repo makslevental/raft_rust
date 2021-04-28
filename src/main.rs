@@ -1,7 +1,6 @@
 #![allow(warnings)]
 
-#[macro_use]
-extern crate lazy_static;
+extern crate crc32fast;
 
 use crate::constants::NUM_SERVERS;
 use crate::raft::types::{NodeId, RaftNode};
