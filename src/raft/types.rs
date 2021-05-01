@@ -5,12 +5,11 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::NUM_SERVERS;
 use std::collections::HashMap;
 
 pub type LogTerm = u64;
 pub type NodeId = u64;
-pub type LogIndex = u64;
+pub type LogIndex = usize;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -63,7 +62,7 @@ pub struct RaftNode {
     pub MAX_TIMEOUT: usize,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct VoteRequest {
     pub term: LogTerm,
     pub candidate_id: NodeId,
@@ -71,14 +70,14 @@ pub struct VoteRequest {
     pub last_log_term: LogTerm,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct VoteRequestResponse {
     pub node_id: NodeId,
     pub term: LogTerm,
     pub vote_granted: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, macros::FromTuple)]
 pub struct AppendEntriesRequest {
     pub term: LogTerm,
     pub leader_id: NodeId,
@@ -88,43 +87,43 @@ pub struct AppendEntriesRequest {
     pub leader_commit: LogIndex,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct AppendEntriesResponse {
     pub node_id: NodeId,
     pub term: LogTerm,
     pub success: bool,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct Heartbeat {
     pub term: LogTerm,
     pub node_id: NodeId,
     pub leader_commit: LogIndex,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct HeartbeatResponse {
     pub success: bool,
     pub node_id: NodeId,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, macros::FromTuple)]
 pub struct ClientRequest {
     pub message: String,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct ClientResponse {
     pub success: bool,
     pub leader_id: NodeId,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct Ping {
     pub pinger_id: NodeId,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, macros::FromTuple)]
 pub struct PingResponse {
     pub pinger_id: NodeId,
     pub ponger_id: NodeId,

@@ -1,4 +1,4 @@
-use crate::raft::types::{LogTerm, NodeId, RaftNode, Role};
+use crate::raft::types::{LogEntry, LogTerm, NodeId, RaftNode, Role};
 use simple_logger::SimpleLogger;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const RAFT_ELECTION_GRACE_PERIOD: u64 = 1;
-const REPEATS: usize = 10;
-const NUM_SERVERS: usize = 3;
+const REPEATS: usize = 1;
+const NUM_SERVERS: usize = 10;
 
 fn build_raft_nodes(
     num_servers: usize,
@@ -53,18 +53,13 @@ fn build_raft_nodes(
 }
 
 fn check_no_leader(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<(), String> {
+    println!("check no leader {:?}", raft_nodes);
     // try a few times in case re-elections are needed.
-    for i in 0..REPEATS {
+    for i in 0..10 {
         thread::sleep(Duration::from_millis(500));
         let mut leaders: HashMap<LogTerm, Vec<NodeId>> = Default::default();
-        for arc_r in raft_nodes {
-            let mut r_lock = arc_r.try_lock();
-            let r;
-            if r_lock.is_ok() {
-                r = r_lock.unwrap();
-            } else {
-                continue;
-            }
+        for r in raft_nodes {
+            let r = r.lock().unwrap();
 
             if r.role == Role::Leader {
                 if !leaders.contains_key(&r.persistent_state.current_term) {
@@ -99,18 +94,13 @@ fn check_no_leader(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<(), String>
 }
 
 fn check_one_leader(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<NodeId, String> {
+    println!("check one leader {:?}", raft_nodes);
     // try a few times in case re-elections are needed.
-    for i in 0..REPEATS {
+    for i in 0..10 {
         thread::sleep(Duration::from_millis(500));
         let mut leaders: HashMap<LogTerm, Vec<NodeId>> = Default::default();
-        for arc_r in raft_nodes {
-            let mut r_lock = arc_r.try_lock();
-            let r;
-            if r_lock.is_ok() {
-                r = r_lock.unwrap();
-            } else {
-                continue;
-            }
+        for r in raft_nodes {
+            let r = r.lock().unwrap();
 
             if r.role == Role::Leader {
                 if !leaders.contains_key(&r.persistent_state.current_term) {
@@ -170,7 +160,7 @@ fn test_ping_ping() {
     thread::sleep(Duration::from_secs(5));
 
     for raft_node in raft_nodes.iter() {
-        raft_node.lock().unwrap().ping_all_peers();
+        raft_node.lock().unwrap().send_ping();
     }
 
     thread::sleep(Duration::from_secs(5));
@@ -195,7 +185,7 @@ fn test_ping_ping() {
 
 #[test]
 fn test_rigged_election() {
-    // SimpleLogger::new().init().unwrap();
+    SimpleLogger::new().init().unwrap();
 
     for num_servers in 3..=NUM_SERVERS {
         for _ in 0..REPEATS {
@@ -267,7 +257,7 @@ fn test_rigged_election() {
 }
 
 #[test]
-fn test_initial_election_2a() {
+fn test_initial_election() {
     // SimpleLogger::new().init().unwrap();
 
     for num_servers in 3..=NUM_SERVERS {
@@ -329,10 +319,10 @@ fn test_initial_election_2a() {
 }
 
 #[test]
-fn test_reelection_2a() {
+fn test_reelection() {
     // SimpleLogger::new().init().unwrap();
 
-    for num_servers in 3..=NUM_SERVERS {
+    for num_servers in 5..=NUM_SERVERS {
         for _ in 0..REPEATS {
             let majority = if num_servers % 2 == 1 {
                 (num_servers + 1) / 2
@@ -370,7 +360,14 @@ fn test_reelection_2a() {
             {
                 let pause_node = raft_nodes.get(original_leader_id as usize).unwrap().lock();
                 thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
-                new_leader = check_one_leader(&raft_nodes);
+                drop(pause_node);
+                new_leader = check_one_leader(
+                    &raft_nodes
+                        .iter()
+                        .filter(|r| r.lock().unwrap().id != original_leader_id)
+                        .map(|r| r.clone())
+                        .collect(),
+                );
                 assert!(new_leader.is_ok(), format!("{:?}", new_leader));
                 assert_ne!(new_leader.clone().unwrap(), original_leader_id);
             }
@@ -385,13 +382,29 @@ fn test_reelection_2a() {
             {
                 thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
                 let pause_node = raft_nodes.get(new_leader_id as usize).unwrap().lock();
-                let locks: Vec<LockResult<MutexGuard<RaftNode>>> = (0..majority)
-                    .filter(|&i| i != new_leader_id as usize)
-                    .map(|i| raft_nodes.get(i as usize).unwrap().lock())
+                let maj_nodes: Vec<_> = if new_leader_id <= (majority - 1) as u64 {
+                    (0..majority + 1)
+                        .filter(|&i| i != new_leader_id as usize)
+                        .collect()
+                } else {
+                    (0..majority).collect()
+                };
+                let locks: Vec<LockResult<MutexGuard<RaftNode>>> = maj_nodes
+                    .iter()
+                    .filter(|&&i| i != new_leader_id as usize)
+                    .map(|i| raft_nodes.get(*i as usize).unwrap().lock())
                     .collect();
                 thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
-                assert!(check_no_leader(&raft_nodes).is_ok(), "found some leader");
-                drop(locks);
+                assert!(
+                    check_no_leader(
+                        &(0..num_servers)
+                            .filter(|i| *i != new_leader_id as usize && !maj_nodes.contains(i))
+                            .map(|i| raft_nodes.get(i).unwrap().clone())
+                            .collect(),
+                    )
+                    .is_ok(),
+                    "found some leader"
+                );
             }
             thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
 
@@ -399,6 +412,89 @@ fn test_reelection_2a() {
             // if a quorum arises, it should elect a leader.
             let some_leader = check_one_leader(&raft_nodes);
             assert!(some_leader.is_ok(), format!("{:?}", some_leader));
+
+            println!("tests with {:?} nodes successfully completed", num_servers);
+
+            for (handle, tx) in background_handles {
+                tx.send(());
+                handle.join().unwrap();
+            }
+
+            for (handle, tx) in server_handles {
+                tx.send(());
+                handle.join().unwrap();
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn test_distribute() {
+    SimpleLogger::new().init().unwrap();
+
+    for num_servers in 3..=NUM_SERVERS {
+        for _ in 0..REPEATS {
+            let majority = if num_servers % 2 == 1 {
+                (num_servers + 1) / 2
+            } else {
+                num_servers / 2 + 1
+            };
+            let raft_nodes = build_raft_nodes(num_servers, majority, 150, 300);
+
+            let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                .iter()
+                .map(|r| RaftNode::start_server(r.clone()))
+                .collect();
+
+            thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            for raft_node in raft_nodes.iter() {
+                raft_node.lock().unwrap().connect_to_peers();
+            }
+
+            thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            let background_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                .iter()
+                .map(|r| RaftNode::start_background_tasks(r.clone()))
+                .collect();
+
+            println!("start tests with {:?} nodes", num_servers);
+
+            thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            let leader = check_one_leader(&raft_nodes);
+            assert!(leader.is_ok(), format!("{:?}", leader));
+            let original_leader_id = leader.unwrap();
+            let mut leader = raft_nodes
+                .get(original_leader_id as usize)
+                .unwrap()
+                .lock()
+                .unwrap();
+            let current_term = leader.persistent_state.current_term;
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing1".to_string(),
+                term: current_term,
+            });
+
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing2".to_string(),
+                term: current_term,
+            });
+
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing3".to_string(),
+                term: current_term,
+            });
+            let leader_log = leader.persistent_state.log.clone();
+            drop(leader);
+            thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            for (i, raft_node) in raft_nodes.iter().enumerate() {
+                assert_eq!(leader_log, raft_node.lock().unwrap().persistent_state.log)
+            }
 
             println!("tests with {:?} nodes successfully completed", num_servers);
 

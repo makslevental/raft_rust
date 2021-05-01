@@ -1,6 +1,7 @@
 #![allow(warnings)]
 
 extern crate crc32fast;
+extern crate proc_macro;
 
 use crate::constants::NUM_SERVERS;
 use crate::raft::types::{NodeId, RaftNode};

@@ -20,9 +20,9 @@ use velcro::{hash_map, iter, vec};
 
 use crate::constants::MESSAGE_LENGTH;
 use crate::raft::types::{
-    AppendEntriesRequest, CRCMessage, Heartbeat, LeaderState, LogEntry, LogIndex, LogTerm, Message,
-    NodeId, Peer, PersistentState, Ping, PingResponse, RaftNode, Role, VolatileState, VoteRequest,
-    VoteRequestResponse,
+    AppendEntriesRequest, AppendEntriesResponse, CRCMessage, Heartbeat, LeaderState, LogEntry,
+    LogIndex, LogTerm, Message, NodeId, Peer, PersistentState, Ping, PingResponse, RaftNode, Role,
+    VolatileState, VoteRequest, VoteRequestResponse,
 };
 
 impl RaftNode {
@@ -76,13 +76,6 @@ impl RaftNode {
         r
     }
 
-    pub fn connect_to_peers(&mut self) {
-        debug!("node {:?} connecting to peers {:?}", self.id, self.peers);
-        for (_pid, mut peer) in self.peers.iter_mut() {
-            peer.connection = Some(TcpStream::connect(peer.address).unwrap());
-        }
-    }
-
     pub fn start_election(&mut self) {
         debug!("node {:?} starting election", self.id);
         // Each candidate restarts its randomized election timeout at the start of an election,
@@ -131,19 +124,27 @@ impl RaftNode {
             None => false,
         }
     }
+
+    fn get_last_log_index(&self) -> LogIndex {
+        (self.persistent_state.log.len() - 1)
+    }
+
+    fn get_last_log_term(&self) -> LogTerm {
+        self.persistent_state.log[self.get_last_log_index() as usize].term
+    }
+
+    fn convert_to_follower(&mut self, term: LogTerm, leader_id: NodeId) {
+        self.role = Role::Follower;
+        self.leader_state = None;
+        self.persistent_state.current_term = term;
+        // TODO who do i follow if term T > currentTerm
+        self.current_leader = Some(leader_id);
+        self.persistent_state.voted_for = None;
+        self.refresh_timeout();
+    }
 }
 
 impl RaftNode {
-    pub fn send_vote_requests(&mut self, term: LogTerm) {
-        let message = Message::V(VoteRequest {
-            term,
-            candidate_id: self.id,
-            last_log_index: self.get_last_log_index(),
-            last_log_term: self.get_last_log_term(),
-        });
-        self.send_to_all_peers(message)
-    }
-
     // Current terms are exchanged whenever servers communicate; if one server’s current term is
     // smaller than the other’s, then it updates its current term to the larger value.
     // If a candidate or leader discovers that its term is out of date, it immediately reverts to
@@ -154,7 +155,7 @@ impl RaftNode {
 
         if self.persistent_state.current_term < vr.term {
             // switch to follower but not necessarily follow this node
-            self.convert_to_follower(vr.term, Some(vr.candidate_id));
+            self.convert_to_follower(vr.term, vr.candidate_id);
         }
 
         if self.persistent_state.current_term > vr.term {
@@ -179,11 +180,7 @@ impl RaftNode {
                 };
             }
         }
-        return VoteRequestResponse {
-            node_id: self.id,
-            term: self.persistent_state.current_term,
-            vote_granted: false,
-        };
+        return (self.id, self.persistent_state.current_term, false).into();
     }
 
     pub fn handle_vote_request_response(&mut self, vrr: VoteRequestResponse) {
@@ -199,7 +196,7 @@ impl RaftNode {
         }
 
         if self.persistent_state.current_term < vrr.term {
-            self.convert_to_follower(vrr.term, Some(vrr.node_id));
+            self.convert_to_follower(vrr.term, vrr.node_id);
             return;
         }
 
@@ -278,19 +275,6 @@ impl RaftNode {
     //     res
     // }
     //
-    fn send_heartbeat(&mut self) {
-        let rpc_message = Message::H(Heartbeat {
-            term: self.persistent_state.current_term,
-            node_id: self.id,
-            leader_commit: self.volatile_state.commit_index,
-        });
-        self.send_to_all_peers(rpc_message);
-
-        // A touch of randomness, so that we can get the chance
-        // to have other leader elections.
-        // let mut rng = rand::thread_rng();
-        // thread::sleep(Duration::new(rng.gen_range(1..7), 0));
-    }
 
     pub fn handle_heartbeat(&mut self, heartbeat: Heartbeat) {
         debug!(
@@ -314,7 +298,7 @@ impl RaftNode {
                 "node {} becoming follower. The new leader is: {}",
                 self.id, heartbeat.node_id
             );
-            self.convert_to_follower(heartbeat.term, Some(heartbeat.node_id));
+            self.convert_to_follower(heartbeat.term, heartbeat.node_id);
 
             // If leaderCommit > commitIndex, set commitIndex =
             // min(leaderCommit, index of last new entry)
@@ -329,115 +313,175 @@ impl RaftNode {
         }
     }
 
-    // // TODO retries here if nodes go down?
-    // fn send_append_entries(&mut self) {
-    //     let term = self.persistent_state.current_term;
-    //     for (pid, peer) in self.peers.iter_mut() {
-    //         let (pid, next_indicies) = &self.leader_state.as_mut().unwrap().next_index;
-    //         while let Some(&next_log_index) = next_indicies.get(&peer.id) {
-    //             let prev_log_index = next_log_index - 1;
-    //             let prev_log_term = self.persistent_state.log[prev_log_index].term;
-    //             let entries = self.persistent_state.log[next_log_index..].to_vec();
-    //             let rpc_message = Message::A(AppendEntriesRequest {
-    //                 term,
-    //                 leader_id: self.id,
-    //                 prev_log_index,
-    //                 prev_log_term,
-    //                 entries,
-    //                 leader_commit: self.volatile_state.commit_index,
-    //             });
-    //             peer.connection
-    //                 .as_mut()
-    //                 .unwrap()
-    //                 .write(&bincode::serialize(&rpc_message).unwrap())
-    //                 .unwrap();
-    //         }
-    //     }
-    // }
-    //
-    // pub fn handele_append_entries(&mut self, a: AppendEntriesRequest) -> (NodeId, LogTerm, bool) {
-    //     // Reply false if term < currentTerm
-    //     if a.term < self.persistent_state.current_term {
-    //         return (self.id, self.persistent_state.current_term, false);
-    //     }
-    //
-    //     // Reply false if log doesn’t contain an entry at prevLogIndex
-    //     // whose term matches prevLogTerm
-    //     if self.persistent_state.log.get(a.prev_log_index).is_none()
-    //         || self
-    //             .persistent_state
-    //             .log
-    //             .get(a.prev_log_index)
-    //             .unwrap()
-    //             .term
-    //             != a.prev_log_term
-    //     {
-    //         return (self.id, self.persistent_state.current_term, false);
-    //     }
-    //
-    //     // If an existing entry conflicts with a new one (same index
-    //     // but different terms), delete the existing entry and all that
-    //     // follow it
-    //     let matching_entries: Vec<LogEntry> = self.persistent_state.log[(a.prev_log_index + 1)..]
-    //         .iter()
-    //         .zip(a.entries.iter())
-    //         .filter_map(|(recorded_entry, new_entry)| {
-    //             recorded_entry.eq(new_entry).then(|| recorded_entry.clone())
-    //         })
-    //         .collect();
-    //     self.persistent_state.log.truncate(a.prev_log_index + 1);
-    //     // Append any new entries not already in the log
-    //     self.persistent_state.log.extend(matching_entries);
-    //
-    //     // If leaderCommit > commitIndex, set commitIndex =
-    //     // min(leaderCommit, index of last new entry)
-    //     if a.leader_commit > self.volatile_state.commit_index {
-    //         self.volatile_state.commit_index =
-    //             min(a.leader_commit, self.persistent_state.log.len() - 1);
-    //     }
-    //
-    //     // If the leader’s term (included in its RPC) is at least as large as the candidate’s current term,
-    //     // then the candidate recognizes the leader as legitimate and returns to follower state.
-    //     self.current_leader = Some(a.leader_id);
-    //     self.role = Role::Follower;
-    //     (self.id, self.persistent_state.current_term, true)
-    // }
+    fn make_append_entries(&self, node_id: NodeId) -> AppendEntriesRequest {
+        let next_index = self
+            .leader_state
+            .as_ref()
+            .unwrap_or_else(|| panic!("{:?}", self.id))
+            .next_index
+            .get(&node_id)
+            .unwrap();
+        let prev_log_index = next_index - 1;
+        let prev_log_term = self.persistent_state.log[prev_log_index].term;
+        let entries = self.persistent_state.log[*next_index as usize..].to_vec();
+        (
+            self.persistent_state.current_term,
+            self.id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            self.volatile_state.commit_index,
+        )
+            .into()
+    }
 
-    // pub fn handle_append_entries_response(&self) {
-    //     let mut buffer = [0; MESSAGE_LENGTH];
-    //     peer.connection.as_mut().unwrap().read(&mut buffer).unwrap();
-    //     match bincode::deserialize(&buffer).unwrap() {
-    //         // consistency check passes -> break while
-    //         Message::AR(AppendEntriesResponse {
-    //             success, peer_id, ..
-    //         }) if success => {
-    //             next_indicies[peer_id] = self.get_last_log_index() + 1;
-    //         }
-    //         // consistency check passes -> decrement prev_log_index
-    //         Message::AR(AppendEntriesResponse {
-    //             success, peer_id, ..
-    //         }) if !success => {
-    //             // After a rejection, the leader decrements nextIndex and retries the AppendEntries RPC.
-    //             // Eventually nextIndex will reach a point where the leader and follower logs match.
-    //             if next_log_index == 0 {
-    //                 panic!()
-    //             }
-    //             next_indicies[peer_id] -= 1;
-    //         }
-    //         _ => panic!(),
-    //     };
-    // }
-    pub fn ping_all_peers(&mut self) {
-        debug!("node {:?} sending ping to all peers", self.id);
-        self.send_to_all_peers(Message::P(Ping { pinger_id: self.id }))
+    pub fn handle_append_entries(&mut self, a: AppendEntriesRequest) -> AppendEntriesResponse {
+        debug!("node {:?} received append entries request {:?}", self.id, a);
+
+        // Reply false if term < currentTerm (§5.1)
+        if self.persistent_state.current_term > a.term {
+            return (self.id, self.persistent_state.current_term, false).into();
+        }
+
+        // If RPC request or response contains term T > currentTerm: set currentTerm = T,
+        // convert to follower (§5.1)
+        if self.persistent_state.current_term <= a.term {
+            self.convert_to_follower(a.term, a.leader_id);
+        }
+
+        // Reply false if log doesn’t contain an entry at prevLogIndex
+        // whose term matches prevLogTerm
+        if self.persistent_state.log.get(a.prev_log_index).is_none()
+            || self
+                .persistent_state
+                .log
+                .get(a.prev_log_index)
+                .unwrap()
+                .term
+                != a.prev_log_term
+        {
+            return (self.id, self.persistent_state.current_term, false).into();
+        }
+
+        // If an existing entry conflicts with a new one (same index
+        // but different terms), delete the existing entry and all that
+        // follow it
+        println!("entries {:?}", a.entries);
+        let matching_entries: Vec<LogEntry> = self.persistent_state.log[(a.prev_log_index + 1)..]
+            .iter()
+            .zip(a.entries.iter())
+            .filter_map(|(recorded_entry, new_entry)| {
+                recorded_entry.eq(new_entry).then(|| recorded_entry.clone())
+            })
+            .collect();
+        self.persistent_state.log.truncate(a.prev_log_index + 1);
+        // Append any new entries not already in the log
+        let num_matching_entries = matching_entries.len();
+        self.persistent_state.log.extend(matching_entries);
+        self.persistent_state
+            .log
+            .extend(a.entries[num_matching_entries..].to_vec());
+
+        // If leaderCommit > commitIndex, set commitIndex =
+        // min(leaderCommit, index of last new entry)
+        if a.leader_commit > self.volatile_state.commit_index {
+            self.volatile_state.commit_index =
+                min(a.leader_commit, self.persistent_state.log.len() - 1);
+        }
+
+        return (self.id, self.persistent_state.current_term, true).into();
+    }
+
+    pub fn handle_append_entries_response(&mut self, ar: AppendEntriesResponse) -> bool {
+        debug!(
+            "node {:?} received append entries request response {:?}",
+            self.id, ar
+        );
+
+        if self.persistent_state.current_term > ar.term {
+            return false;
+        }
+
+        if self.persistent_state.current_term <= ar.term {
+            self.convert_to_follower(ar.term, ar.node_id);
+            return false;
+        }
+
+        // whether to resend or not
+        if match ar {
+            // consistency check passes -> don't resend
+            AppendEntriesResponse { success, .. } if success => {
+                *(self
+                    .leader_state
+                    .as_mut()
+                    .unwrap()
+                    .next_index
+                    .get_mut(&ar.node_id)
+                    .unwrap()) = self.get_last_log_index() + 1;
+
+                // TODO: match index update??
+                *(self
+                    .leader_state
+                    .as_mut()
+                    .unwrap()
+                    .match_index
+                    .get_mut(&ar.node_id)
+                    .unwrap()) = self.get_last_log_index();
+
+                false
+            }
+            // consistency check fails -> decrement prev_log_index
+            // then resend
+            AppendEntriesResponse { success, .. } if !success => {
+                // After a rejection, the leader decrements nextIndex and retries the AppendEntries RPC.
+                // Eventually nextIndex will reach a point where the leader and follower logs match.
+                *(self
+                    .leader_state
+                    .as_mut()
+                    .unwrap()
+                    .next_index
+                    .get_mut(&ar.node_id)
+                    .unwrap()) -= 1;
+                true
+            }
+            _ => panic!(),
+        } {
+            return true;
+        }
+
+        //  If there exists an N such that N > commitIndex, a majority
+        // of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+        let min_match_index = self
+            .leader_state
+            .as_ref()
+            .unwrap()
+            .match_index
+            .values()
+            .min()
+            .unwrap();
+
+        let N = self
+            .persistent_state
+            .log
+            .iter()
+            .enumerate()
+            .filter(|(i, log)| {
+                log.term == self.persistent_state.current_term
+                    && &self.volatile_state.commit_index < i
+                    && i <= min_match_index
+            })
+            .last();
+
+        if let Some((N, _log)) = N {
+            self.volatile_state.commit_index = N;
+        }
+
+        return false;
     }
 
     pub fn handle_ping(&mut self, p: Ping) -> PingResponse {
         debug!("node {:?} handling ping {:?}", self.id, p);
-        PingResponse {
-            pinger_id: p.pinger_id,
-            ponger_id: self.id,
-        }
+        (p.pinger_id, self.id).into()
     }
 
     pub fn handle_ping_response(&mut self, pr: PingResponse) {
@@ -454,45 +498,49 @@ impl RaftNode {
     pub fn start_background_tasks(this: Arc<Mutex<Self>>) -> (JoinHandle<()>, Sender<()>) {
         let (tx, rx) = mpsc::channel();
         let this_clone = this.clone();
-        let handle = thread::spawn(move || loop {
-            let mut rng = rand::thread_rng();
+        let builder = thread::Builder::new()
+            .name(format!("{:?} background tasks", this_clone.lock().unwrap().id).into());
+        let handle = builder
+            .spawn(move || loop {
+                // TODO: becareful about holding locks for too long!!!
 
-            // TODO: becareful about holding locks for too long!!!
-
-            // broadcast heartbeat if leader
-            {
-                let mut this_node = this_clone.lock().unwrap();
-                if this_node.has_timed_out() {
-                    // not leader therefore check time out and run election
-                    this_node.start_election();
-                }
-            }
-
-            {
-                // "work" -> will become append entries or service client request
-                thread::sleep(Duration::from_millis(
-                    rng.gen_range(15..30).try_into().unwrap(),
-                ));
-            }
-
-            {
-                let mut this_node = this_clone.lock().unwrap();
-                if this_node.role == Role::Leader {
-                    this_node.send_heartbeat();
-                }
-            }
-
-            {
-                let this_node = this_clone.lock().unwrap();
-                match rx.try_recv() {
-                    Ok(_) | Err(TryRecvError::Disconnected) => {
-                        debug!("node {:?} terminating background tasks", this_node.id);
-                        break;
+                // broadcast heartbeat if leader
+                {
+                    let mut this_node = this_clone.lock().unwrap();
+                    if this_node.has_timed_out() {
+                        // not leader therefore check time out and run election
+                        this_node.start_election();
                     }
-                    Err(TryRecvError::Empty) => {}
                 }
-            }
-        });
+
+                {
+                    let mut this_node = this_clone.lock().unwrap();
+                    if this_node.role == Role::Leader {
+                        this_node.send_heartbeat();
+                        this_node.send_append_entries();
+                    }
+                }
+
+                {
+                    let mut this_node = this_clone.lock().unwrap();
+                    if this_node.role == Role::Leader {
+                        this_node.send_append_entries();
+                    }
+                }
+
+                {
+                    let this_node = this_clone.lock().unwrap();
+                    match rx.try_recv() {
+                        Ok(_) | Err(TryRecvError::Disconnected) => {
+                            debug!("node {:?} terminating background tasks", this_node.id);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            })
+            .unwrap();
         (handle, tx)
     }
 
@@ -519,7 +567,9 @@ impl RaftNode {
                         // listener should be nonblocking but not stream
                         stream.set_nonblocking(false);
                         let this = this.clone();
-                        thread::spawn(move || Self::handle_connection(this, stream));
+                        let builder = thread::Builder::new()
+                            .name(format!("{:?} handle connection", this.lock().unwrap().id));
+                        builder.spawn(move || Self::handle_connection(this, stream));
                     }
                     Err(err) => {
                         if err.kind() != io::ErrorKind::WouldBlock {
@@ -585,10 +635,19 @@ impl RaftNode {
                 Message::VR(vr) => {
                     this.handle_vote_request_response(vr);
                 }
-                // Message::A(a) => {
-                //     let ar = this.handele_append_entries(a);
-                //     bincode::serialize(&ar).unwrap();
-                // }
+                Message::A(a) => {
+                    let leader_id = a.leader_id;
+                    let ar = Message::AR(this.handle_append_entries(a));
+                    this.send(leader_id, ar);
+                }
+                Message::AR(ar) => {
+                    let success = this.handle_append_entries_response(ar);
+                    // TODO: node might've lost leadership role
+                    if !success && this.role == Role::Leader {
+                        let a = Message::A(this.make_append_entries(ar.node_id));
+                        this.send(ar.node_id, a);
+                    }
+                }
                 Message::H(h) => {
                     this.handle_heartbeat(h);
                 }
@@ -601,11 +660,6 @@ impl RaftNode {
     }
 
     fn send(&mut self, node_id: NodeId, message: Message) {
-        // TODO: not sure where this is coming from
-        // but i'm getting vote requests from overflow ids
-        // if !self.peers.contains_key(&node_id) {
-        //     return;
-        // }
         let mut peer_stream = self
             .peers
             .get_mut(&node_id)
@@ -625,6 +679,13 @@ impl RaftNode {
         peer_stream.flush().unwrap();
     }
 
+    pub fn connect_to_peers(&mut self) {
+        debug!("node {:?} connecting to peers {:?}", self.id, self.peers);
+        for (_pid, mut peer) in self.peers.iter_mut() {
+            peer.connection = Some(TcpStream::connect(peer.address).unwrap());
+        }
+    }
+
     fn send_to_all_peers(&mut self, message: Message) {
         debug!(
             "node {:?} sending message {:?} to all peers",
@@ -635,40 +696,75 @@ impl RaftNode {
             self.peers.iter_mut().for_each(|(_, peer)| {
                 let message = message.clone();
                 let mut peer_stream = peer.connection.as_mut().unwrap();
-                scope.spawn(move |_| {
-                    debug!(
-                        "node {:?} sending message {:?} to {:?}",
-                        self_id,
-                        message,
-                        peer_stream.peer_addr()
-                    );
-                    let rpc_message = CRCMessage::new(message);
-                    let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
-                    peer_stream.write(&rpc_message_bin).unwrap();
-                    peer_stream.flush().unwrap();
-                });
+                scope
+                    .builder()
+                    .name(format!("{:?} send to all peers", self_id))
+                    .spawn(move |_| {
+                        debug!(
+                            "node {:?} sending message {:?} to {:?}",
+                            self_id,
+                            message,
+                            peer_stream.peer_addr()
+                        );
+                        let rpc_message = CRCMessage::new(message);
+                        let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
+                        peer_stream.write(&rpc_message_bin).unwrap();
+                        peer_stream.flush().unwrap();
+                    });
             })
         })
         .unwrap();
     }
-}
 
-impl RaftNode {
-    fn get_last_log_index(&self) -> LogIndex {
-        (self.persistent_state.log.len() - 1) as u64
+    pub fn send_vote_requests(&mut self, term: LogTerm) {
+        let message = Message::V(VoteRequest {
+            term,
+            candidate_id: self.id,
+            last_log_index: self.get_last_log_index(),
+            last_log_term: self.get_last_log_term(),
+        });
+        self.send_to_all_peers(message)
     }
 
-    fn get_last_log_term(&self) -> LogTerm {
-        self.persistent_state.log[self.get_last_log_index() as usize].term
+    fn send_heartbeat(&mut self) {
+        let rpc_message = Message::H(Heartbeat {
+            term: self.persistent_state.current_term,
+            node_id: self.id,
+            leader_commit: self.volatile_state.commit_index,
+        });
+        self.send_to_all_peers(rpc_message);
+
+        // A touch of randomness, so that we can get the chance
+        // to have other leader elections.
+        // let mut rng = rand::thread_rng();
+        // thread::sleep(Duration::new(rng.gen_range(1..7), 0));
     }
 
-    fn convert_to_follower(&mut self, term: LogTerm, leader_id: Option<NodeId>) {
-        self.role = Role::Follower;
-        self.leader_state = None;
-        self.persistent_state.current_term = term;
-        // TODO who do i follow if term T > currentTerm
-        self.current_leader = leader_id;
-        self.persistent_state.voted_for = None;
-        self.refresh_timeout();
+    fn send_append_entries(&mut self) {
+        let messages: Vec<(NodeId, AppendEntriesRequest)> = self
+            .peers
+            .keys()
+            .flat_map(|&pid| {
+                let a = self.make_append_entries(pid);
+                if a.entries.len() > 0 {
+                    Some((pid, a))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (pid, message) in messages.into_iter() {
+            debug!(
+                "node {:?} sending to {:?} entry {:?} ",
+                self.id, pid, message
+            );
+            self.send(pid, Message::A(message));
+        }
+    }
+
+    pub fn send_ping(&mut self) {
+        debug!("node {:?} sending ping to all peers", self.id);
+        self.send_to_all_peers(Message::P(Ping { pinger_id: self.id }))
     }
 }
