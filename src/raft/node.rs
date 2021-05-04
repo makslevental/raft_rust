@@ -1,4 +1,4 @@
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::Debug;
@@ -24,6 +24,7 @@ use crate::raft::types::{
     LogIndex, LogTerm, Message, NodeId, Peer, PersistentState, Ping, PingResponse, RaftNode, Role,
     VolatileState, VoteRequest, VoteRequestResponse,
 };
+use counter::Counter;
 
 impl RaftNode {
     pub fn new(
@@ -40,6 +41,10 @@ impl RaftNode {
                 voted_for: None,
                 log: vec![LogEntry {
                     // initialize so that subtracting to get prev_index gives 0 instead of -1
+                    message: "NULL".to_string(),
+                    term: 0,
+                }],
+                state_machine: vec![LogEntry {
                     message: "NULL".to_string(),
                     term: 0,
                 }],
@@ -304,7 +309,13 @@ impl RaftNode {
             // min(leaderCommit, index of last new entry)
             if heartbeat.leader_commit > self.volatile_state.commit_index {
                 self.volatile_state.commit_index =
-                    min(heartbeat.leader_commit, self.get_last_log_index())
+                    min(heartbeat.leader_commit, self.get_last_log_index());
+                if self.volatile_state.commit_index > self.volatile_state.last_applied {
+                    self.volatile_state.last_applied += 1;
+                    self.persistent_state
+                        .state_machine
+                        .push(self.persistent_state.log[self.volatile_state.last_applied].clone())
+                }
             }
 
             // TODO
@@ -366,18 +377,19 @@ impl RaftNode {
         // If an existing entry conflicts with a new one (same index
         // but different terms), delete the existing entry and all that
         // follow it
-        println!("entries {:?}", a.entries);
-        let matching_entries: Vec<LogEntry> = self.persistent_state.log[(a.prev_log_index + 1)..]
+        let current_index = a.prev_log_index + 1;
+        let matching_entries: Vec<LogEntry> = self.persistent_state.log[current_index..]
             .iter()
             .zip(a.entries.iter())
-            .filter_map(|(recorded_entry, new_entry)| {
-                recorded_entry.eq(new_entry).then(|| recorded_entry.clone())
-            })
+            .take_while(|(recorded_entry, new_entry)| recorded_entry.term == new_entry.term)
+            .map(|e| e.0.clone())
             .collect();
-        self.persistent_state.log.truncate(a.prev_log_index + 1);
+        // this truncates upto and including prev_log_index (i.e. len)
+        self.persistent_state.log.truncate(current_index);
         // Append any new entries not already in the log
         let num_matching_entries = matching_entries.len();
         self.persistent_state.log.extend(matching_entries);
+        // append remaining entries
         self.persistent_state
             .log
             .extend(a.entries[num_matching_entries..].to_vec());
@@ -420,6 +432,9 @@ impl RaftNode {
                     .unwrap()) = self.get_last_log_index() + 1;
 
                 // TODO: match index update??
+                // TODO i think this could be different from last log index
+                // if append entries sends only one entry at a time
+                // then next
                 *(self
                     .leader_state
                     .as_mut()
@@ -449,32 +464,50 @@ impl RaftNode {
             return true;
         }
 
+        // TODO is this right?
         //  If there exists an N such that N > commitIndex, a majority
         // of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
-        let min_match_index = self
+
+        for (&&midx, &ct) in self
             .leader_state
             .as_ref()
             .unwrap()
             .match_index
             .values()
-            .min()
-            .unwrap();
-
-        let N = self
-            .persistent_state
-            .log
+            .collect::<Counter<_>>()
             .iter()
-            .enumerate()
-            .filter(|(i, log)| {
-                log.term == self.persistent_state.current_term
-                    && &self.volatile_state.commit_index < i
-                    && i <= min_match_index
-            })
-            .last();
-
-        if let Some((N, _log)) = N {
-            self.volatile_state.commit_index = N;
+        {
+            if ct >= self.MAJORITY
+                && self.persistent_state.log.get(midx).unwrap().term
+                    == self.persistent_state.current_term
+            {
+                self.volatile_state.commit_index = max(self.volatile_state.commit_index, midx);
+            }
         }
+        // let min_match_index = self
+        //     .leader_state
+        //     .as_ref()
+        //     .unwrap()
+        //     .match_index
+        //     .values()
+        //     .min()
+        //     .unwrap();
+        //
+        // let N = self
+        //     .persistent_state
+        //     .log
+        //     .iter()
+        //     .enumerate()
+        //     .filter(|(i, log)| {
+        //         log.term == self.persistent_state.current_term
+        //             && &self.volatile_state.commit_index < i
+        //             && i <= min_match_index
+        //     })
+        //     .last();
+        //
+        // if let Some((N, _log)) = N {
+        //     self.volatile_state.commit_index = N;
+        // }
 
         return false;
     }

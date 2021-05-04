@@ -29,6 +29,7 @@ pub struct PersistentState {
     pub current_term: LogTerm,
     pub voted_for: Option<NodeId>,
     pub log: Vec<LogEntry>,
+    pub state_machine: Vec<LogEntry>,
 }
 
 #[derive(Debug)]

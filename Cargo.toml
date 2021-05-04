@@ -14,3 +14,4 @@ crc32fast = "1.2.1"
 log = "0.4.14"
 simple_logger = "1.11.0"
 macros = { path = "macros" }
+counter = "0.5.2"

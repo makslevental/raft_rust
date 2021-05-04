@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const RAFT_ELECTION_GRACE_PERIOD: u64 = 1;
-const REPEATS: usize = 1;
+const REPEATS: usize = 10;
 const NUM_SERVERS: usize = 10;
 
 fn build_raft_nodes(
@@ -144,7 +144,7 @@ fn check_terms(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<LogTerm, String
 }
 
 #[test]
-fn test_ping_ping() {
+fn test_ping_pong() {
     // SimpleLogger::new().init().unwrap();
 
     let raft_nodes = build_raft_nodes(NUM_SERVERS, 6, 150, 300);
@@ -431,8 +431,8 @@ fn test_reelection() {
 }
 
 #[test]
-fn test_distribute() {
-    SimpleLogger::new().init().unwrap();
+fn test_basic_agree() {
+    // SimpleLogger::new().init().unwrap();
 
     for num_servers in 3..=NUM_SERVERS {
         for _ in 0..REPEATS {
@@ -474,6 +474,241 @@ fn test_distribute() {
                 .lock()
                 .unwrap();
             let current_term = leader.persistent_state.current_term;
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing1".to_string(),
+                term: current_term,
+            });
+
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing2".to_string(),
+                term: current_term,
+            });
+
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing3".to_string(),
+                term: current_term,
+            });
+            let leader_log = leader.persistent_state.log.clone();
+            let leader_state_machine = leader.persistent_state.state_machine.clone();
+            let leader_commit_index = leader.volatile_state.commit_index;
+            let leader_last_applied = leader.volatile_state.last_applied;
+            drop(leader);
+            thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            for (i, raft_node) in raft_nodes.iter().enumerate() {
+                assert_eq!(leader_log, raft_node.lock().unwrap().persistent_state.log);
+                assert_eq!(
+                    leader_state_machine,
+                    raft_node.lock().unwrap().persistent_state.state_machine
+                );
+                assert_eq!(
+                    leader_last_applied,
+                    raft_node.lock().unwrap().volatile_state.last_applied
+                );
+                assert_eq!(
+                    leader_commit_index,
+                    raft_node.lock().unwrap().volatile_state.commit_index
+                );
+            }
+
+            println!("tests with {:?} nodes successfully completed", num_servers);
+
+            for (handle, tx) in background_handles {
+                tx.send(());
+                handle.join().unwrap();
+            }
+
+            for (handle, tx) in server_handles {
+                tx.send(());
+                handle.join().unwrap();
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn test_overwrite() {
+    // SimpleLogger::new().init().unwrap();
+
+    for num_servers in 3..=NUM_SERVERS {
+        for _ in 0..REPEATS {
+            let majority = if num_servers % 2 == 1 {
+                (num_servers + 1) / 2
+            } else {
+                num_servers / 2 + 1
+            };
+            let raft_nodes = build_raft_nodes(num_servers, majority, 150, 300);
+
+            let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                .iter()
+                .map(|r| RaftNode::start_server(r.clone()))
+                .collect();
+
+            thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            for raft_node in raft_nodes.iter() {
+                raft_node.lock().unwrap().connect_to_peers();
+            }
+
+            thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            let background_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                .iter()
+                .map(|r| RaftNode::start_background_tasks(r.clone()))
+                .collect();
+
+            println!("start tests with {:?} nodes", num_servers);
+
+            thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            let leader = check_one_leader(&raft_nodes);
+            assert!(leader.is_ok(), format!("{:?}", leader));
+            let leader_id = leader.unwrap();
+            let current_term = raft_nodes
+                .get(leader_id as usize)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .persistent_state
+                .current_term;
+            for raft_node in raft_nodes.iter() {
+                let mut raft_node = raft_node.lock().unwrap();
+                if raft_node.id == leader_id {
+                    continue;
+                }
+                for i in 0..3 {
+                    raft_node.persistent_state.log.push(LogEntry {
+                        message: "WRONG".to_string(),
+                        // TODO: hmm there's no double check if same index same term
+                        // are the same entry. i guess that's because there can only be one
+                        // leader per term?
+                        // term: current_term,
+                        term: 1,
+                    })
+                }
+            }
+
+            let mut leader = raft_nodes.get(leader_id as usize).unwrap().lock().unwrap();
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing1".to_string(),
+                term: current_term,
+            });
+
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing2".to_string(),
+                term: current_term,
+            });
+
+            leader.persistent_state.log.push(LogEntry {
+                message: "testing3".to_string(),
+                term: current_term,
+            });
+
+            let leader_log = leader.persistent_state.log.clone();
+            let leader_state_machine = leader.persistent_state.state_machine.clone();
+            let leader_commit_index = leader.volatile_state.commit_index;
+            let leader_last_applied = leader.volatile_state.last_applied;
+            drop(leader);
+            thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            for (i, raft_node) in raft_nodes.iter().enumerate() {
+                assert_eq!(leader_log, raft_node.lock().unwrap().persistent_state.log);
+                assert_eq!(
+                    leader_state_machine,
+                    raft_node.lock().unwrap().persistent_state.state_machine
+                );
+                assert_eq!(
+                    leader_last_applied,
+                    raft_node.lock().unwrap().volatile_state.last_applied
+                );
+                assert_eq!(
+                    leader_commit_index,
+                    raft_node.lock().unwrap().volatile_state.commit_index
+                );
+            }
+
+            println!("tests with {:?} nodes successfully completed", num_servers);
+
+            for (handle, tx) in background_handles {
+                tx.send(());
+                handle.join().unwrap();
+            }
+
+            for (handle, tx) in server_handles {
+                tx.send(());
+                handle.join().unwrap();
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn test_fail_agree() {
+    // SimpleLogger::new().init().unwrap();
+
+    for num_servers in 3..=NUM_SERVERS {
+        for _ in 0..REPEATS {
+            let majority = if num_servers % 2 == 1 {
+                (num_servers + 1) / 2
+            } else {
+                num_servers / 2 + 1
+            };
+            let raft_nodes = build_raft_nodes(num_servers, majority, 150, 300);
+
+            let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                .iter()
+                .map(|r| RaftNode::start_server(r.clone()))
+                .collect();
+
+            thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            for raft_node in raft_nodes.iter() {
+                raft_node.lock().unwrap().connect_to_peers();
+            }
+
+            thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            let background_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+                .iter()
+                .map(|r| RaftNode::start_background_tasks(r.clone()))
+                .collect();
+
+            println!("start tests with {:?} nodes", num_servers);
+
+            thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
+
+            let leader = check_one_leader(&raft_nodes);
+            assert!(leader.is_ok(), format!("{:?}", leader));
+            let leader_id = leader.unwrap();
+            let current_term = raft_nodes
+                .get(leader_id as usize)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .persistent_state
+                .current_term;
+            for raft_node in raft_nodes.iter() {
+                let mut raft_node = raft_node.lock().unwrap();
+                if raft_node.id == leader_id {
+                    continue;
+                }
+                for i in 0..3 {
+                    raft_node.persistent_state.log.push(LogEntry {
+                        message: "WRONG".to_string(),
+                        // TODO: hmm there's no double check if same index same term
+                        // are the same entry. i guess that's because there can only be one
+                        // leader per term?
+                        // term: current_term,
+                        term: 1,
+                    })
+                }
+            }
+
+            let mut leader = raft_nodes.get(leader_id as usize).unwrap().lock().unwrap();
             leader.persistent_state.log.push(LogEntry {
                 message: "testing1".to_string(),
                 term: current_term,
