@@ -2,14 +2,14 @@ use crate::raft::types::{LogEntry, LogTerm, NodeId, RaftNode, Role};
 use simple_logger::SimpleLogger;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
+
 use std::iter::FromIterator;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const RAFT_ELECTION_GRACE_PERIOD: u64 = 1;
 const REPEATS: usize = 10;
@@ -55,7 +55,7 @@ fn build_raft_nodes(
 fn check_no_leader(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<(), String> {
     println!("check no leader {:?}", raft_nodes);
     // try a few times in case re-elections are needed.
-    for i in 0..10 {
+    for _i in 0..10 {
         thread::sleep(Duration::from_millis(500));
         let mut leaders: HashMap<LogTerm, Vec<NodeId>> = Default::default();
         for r in raft_nodes {
@@ -96,7 +96,7 @@ fn check_no_leader(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<(), String>
 fn check_one_leader(raft_nodes: &Vec<Arc<Mutex<RaftNode>>>) -> Result<NodeId, String> {
     println!("check one leader {:?}", raft_nodes);
     // try a few times in case re-elections are needed.
-    for i in 0..10 {
+    for _i in 0..10 {
         thread::sleep(Duration::from_millis(500));
         let mut leaders: HashMap<LogTerm, Vec<NodeId>> = Default::default();
         for r in raft_nodes {
@@ -148,7 +148,7 @@ fn test_ping_pong() {
     // SimpleLogger::new().init().unwrap();
 
     let raft_nodes = build_raft_nodes(NUM_SERVERS, 6, 150, 300);
-    let server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
+    let _server_handles: Vec<(JoinHandle<()>, Sender<()>)> = raft_nodes
         .iter()
         .map(|r| RaftNode::start_server(r.clone()))
         .collect();
@@ -177,7 +177,7 @@ fn test_ping_pong() {
                 .unwrap()
                 .peers
                 .iter()
-                .map(|(pid, peer)| *pid),
+                .map(|(pid, _peer)| *pid),
         );
         assert_eq!(ping_ponged_peers, all_peers);
     }
@@ -209,7 +209,7 @@ fn test_rigged_election() {
             thread::sleep(Duration::new(RAFT_ELECTION_GRACE_PERIOD, 0));
 
             for raft_node in &raft_nodes[1..] {
-                let id = raft_node.lock().unwrap().id;
+                let _id = raft_node.lock().unwrap().id;
                 raft_node.lock().unwrap().next_timeout = None;
             }
 
@@ -242,12 +242,12 @@ fn test_rigged_election() {
             println!("tests with {:?} nodes successfully completed", num_servers);
 
             for (handle, tx) in background_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
             for (handle, tx) in server_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
@@ -304,12 +304,12 @@ fn test_initial_election() {
             println!("tests with {:?} nodes successfully completed", num_servers);
 
             for (handle, tx) in background_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
             for (handle, tx) in server_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
@@ -372,7 +372,7 @@ fn test_reelection() {
                 assert_ne!(new_leader.clone().unwrap(), original_leader_id);
             }
             // old leader returns
-            let same_leader = check_one_leader(&raft_nodes);
+            let _same_leader = check_one_leader(&raft_nodes);
             assert!(new_leader.is_ok(), format!("{:?}", new_leader));
             let new_leader_id = new_leader.unwrap();
             assert_ne!(new_leader_id, original_leader_id);
@@ -381,7 +381,7 @@ fn test_reelection() {
             // be elected.
             {
                 thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
-                let pause_node = raft_nodes.get(new_leader_id as usize).unwrap().lock();
+                let _pause_node = raft_nodes.get(new_leader_id as usize).unwrap().lock();
                 let maj_nodes: Vec<_> = if new_leader_id <= (majority - 1) as u64 {
                     (0..majority + 1)
                         .filter(|&i| i != new_leader_id as usize)
@@ -389,7 +389,7 @@ fn test_reelection() {
                 } else {
                     (0..majority).collect()
                 };
-                let locks: Vec<LockResult<MutexGuard<RaftNode>>> = maj_nodes
+                let _locks: Vec<LockResult<MutexGuard<RaftNode>>> = maj_nodes
                     .iter()
                     .filter(|&&i| i != new_leader_id as usize)
                     .map(|i| raft_nodes.get(*i as usize).unwrap().lock())
@@ -416,12 +416,12 @@ fn test_reelection() {
             println!("tests with {:?} nodes successfully completed", num_servers);
 
             for (handle, tx) in background_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
             for (handle, tx) in server_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
@@ -495,7 +495,7 @@ fn test_basic_agree() {
             drop(leader);
             thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
 
-            for (i, raft_node) in raft_nodes.iter().enumerate() {
+            for (_i, raft_node) in raft_nodes.iter().enumerate() {
                 assert_eq!(leader_log, raft_node.lock().unwrap().persistent_state.log);
                 assert_eq!(
                     leader_state_machine,
@@ -514,12 +514,12 @@ fn test_basic_agree() {
             println!("tests with {:?} nodes successfully completed", num_servers);
 
             for (handle, tx) in background_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
             for (handle, tx) in server_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
@@ -578,7 +578,7 @@ fn test_overwrite() {
                 if raft_node.id == leader_id {
                     continue;
                 }
-                for i in 0..3 {
+                for _i in 0..3 {
                     raft_node.persistent_state.log.push(LogEntry {
                         message: "WRONG".to_string(),
                         // TODO: hmm there's no double check if same index same term
@@ -613,7 +613,7 @@ fn test_overwrite() {
             drop(leader);
             thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
 
-            for (i, raft_node) in raft_nodes.iter().enumerate() {
+            for (_i, raft_node) in raft_nodes.iter().enumerate() {
                 assert_eq!(leader_log, raft_node.lock().unwrap().persistent_state.log);
                 assert_eq!(
                     leader_state_machine,
@@ -632,12 +632,12 @@ fn test_overwrite() {
             println!("tests with {:?} nodes successfully completed", num_servers);
 
             for (handle, tx) in background_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
             for (handle, tx) in server_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
@@ -696,7 +696,7 @@ fn test_fail_agree() {
                 if raft_node.id == leader_id {
                     continue;
                 }
-                for i in 0..3 {
+                for _i in 0..3 {
                     raft_node.persistent_state.log.push(LogEntry {
                         message: "WRONG".to_string(),
                         // TODO: hmm there's no double check if same index same term
@@ -727,19 +727,19 @@ fn test_fail_agree() {
             drop(leader);
             thread::sleep(Duration::new(2 * RAFT_ELECTION_GRACE_PERIOD, 0));
 
-            for (i, raft_node) in raft_nodes.iter().enumerate() {
+            for (_i, raft_node) in raft_nodes.iter().enumerate() {
                 assert_eq!(leader_log, raft_node.lock().unwrap().persistent_state.log)
             }
 
             println!("tests with {:?} nodes successfully completed", num_servers);
 
             for (handle, tx) in background_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 
             for (handle, tx) in server_handles {
-                tx.send(());
+                tx.send(()).unwrap();
                 handle.join().unwrap();
             }
 

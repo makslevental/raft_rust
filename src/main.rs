@@ -1,12 +1,8 @@
-#![allow(warnings)]
+// #![allow(warnings)]
+#![allow(non_fmt_panic)]
 
 extern crate crc32fast;
 extern crate proc_macro;
-
-use crate::constants::NUM_SERVERS;
-use crate::raft::types::{NodeId, RaftNode};
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
 
 mod constants;
 mod raft;

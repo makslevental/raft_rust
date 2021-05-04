@@ -1,22 +1,21 @@
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::fmt::Debug;
-use std::io::{self, BufRead};
+use std::io::{self};
 use std::io::{Read, Write};
 use std::iter::FromIterator;
-use std::net::{Shutdown, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::net::{SocketAddrV4, TcpListener, TcpStream};
+use std::sync::mpsc::{self, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_utils::thread as crossbeam_thread;
-use log::{debug, info, warn};
+use log::debug;
 use rand::Rng;
-use serde::Serialize;
-use velcro::{hash_map, iter, vec};
+
+use velcro::{hash_map, vec};
 
 use crate::constants::MESSAGE_LENGTH;
 use crate::raft::types::{
@@ -131,7 +130,7 @@ impl RaftNode {
     }
 
     fn get_last_log_index(&self) -> LogIndex {
-        (self.persistent_state.log.len() - 1)
+        self.persistent_state.log.len() - 1
     }
 
     fn get_last_log_term(&self) -> LogTerm {
@@ -598,11 +597,13 @@ impl RaftNode {
                             stream
                         );
                         // listener should be nonblocking but not stream
-                        stream.set_nonblocking(false);
+                        stream.set_nonblocking(false).unwrap();
                         let this = this.clone();
                         let builder = thread::Builder::new()
                             .name(format!("{:?} handle connection", this.lock().unwrap().id));
-                        builder.spawn(move || Self::handle_connection(this, stream));
+                        builder
+                            .spawn(move || Self::handle_connection(this, stream))
+                            .unwrap();
                     }
                     Err(err) => {
                         if err.kind() != io::ErrorKind::WouldBlock {
@@ -693,7 +694,7 @@ impl RaftNode {
     }
 
     fn send(&mut self, node_id: NodeId, message: Message) {
-        let mut peer_stream = self
+        let peer_stream = self
             .peers
             .get_mut(&node_id)
             .unwrap()
@@ -728,7 +729,7 @@ impl RaftNode {
         crossbeam_thread::scope(|scope| {
             self.peers.iter_mut().for_each(|(_, peer)| {
                 let message = message.clone();
-                let mut peer_stream = peer.connection.as_mut().unwrap();
+                let peer_stream = peer.connection.as_mut().unwrap();
                 scope
                     .builder()
                     .name(format!("{:?} send to all peers", self_id))
@@ -743,7 +744,8 @@ impl RaftNode {
                         let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
                         peer_stream.write(&rpc_message_bin).unwrap();
                         peer_stream.flush().unwrap();
-                    });
+                    })
+                    .unwrap();
             })
         })
         .unwrap();
