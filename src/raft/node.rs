@@ -19,9 +19,9 @@ use velcro::{hash_map, vec};
 
 use crate::constants::MESSAGE_LENGTH;
 use crate::raft::types::{
-    AppendEntriesRequest, AppendEntriesResponse, CRCMessage, Heartbeat, LeaderState, LogEntry,
-    LogIndex, LogTerm, Message, NodeId, Peer, PersistentState, Ping, PingResponse, RaftNode, Role,
-    VolatileState, VoteRequest, VoteRequestResponse,
+    AppendEntriesRequest, AppendEntriesResponse, CRCMessage, ClientRequest, ClientResponse,
+    Heartbeat, LeaderState, LogEntry, LogIndex, LogTerm, Message, NodeId, Peer, PersistentState,
+    Ping, PingResponse, RaftNode, Role, VolatileState, VoteRequest, VoteRequestResponse,
 };
 use counter::Counter;
 
@@ -256,29 +256,23 @@ impl RaftNode {
             )
         }
     }
-    // pub fn service_client_request(&mut self, request: Message) -> Message {
-    //     let res = Message::ClientResponse {
-    //         success: false,
-    //         leader_id: self.current_leader.unwrap(),
-    //     };
-    //     if self.role != Role::Leader {
-    //         return res;
-    //     }
-    //     if let Message::ClientRequest { message } = request {
-    //         let l = LogEntry {
-    //             message,
-    //             term: self.persistent_state.current_term,
-    //         };
-    //         self.persistent_state.log.push(l.clone());
-    //         self.send_append_entries();
-    //         return Message::ClientResponse {
-    //             success: true,
-    //             leader_id: self.current_leader.unwrap(),
-    //         };
-    //     }
-    //     res
-    // }
-    //
+
+    pub fn handle_client_request(&mut self, request: ClientRequest) -> ClientResponse {
+        if self.role != Role::Leader {
+            return (false, self.current_leader.unwrap()).into();
+        }
+
+        let l: LogEntry = (request.message, self.persistent_state.current_term).into();
+        self.persistent_state.log.push(l.clone());
+        self.send_append_entries();
+        for _ in 0..20 {
+            if *self.persistent_state.log.last().unwrap() == l {
+                return (true, self.current_leader.unwrap()).into();
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        return (false, self.current_leader.unwrap()).into();
+    }
 
     pub fn handle_heartbeat(&mut self, heartbeat: Heartbeat) {
         debug!(
@@ -296,7 +290,7 @@ impl RaftNode {
 
         // new leader
         if heartbeat.term > self.persistent_state.current_term
-            && self.persistent_state.voted_for.unwrap_or(u64::MAX) == heartbeat.node_id
+            && self.persistent_state.voted_for == Some(heartbeat.node_id)
         {
             debug!(
                 "node {} becoming follower. The new leader is: {}",
@@ -308,13 +302,16 @@ impl RaftNode {
             // min(leaderCommit, index of last new entry)
             if heartbeat.leader_commit > self.volatile_state.commit_index {
                 self.volatile_state.commit_index =
-                    min(heartbeat.leader_commit, self.get_last_log_index());
-                if self.volatile_state.commit_index > self.volatile_state.last_applied {
-                    self.volatile_state.last_applied += 1;
-                    self.persistent_state
-                        .state_machine
-                        .push(self.persistent_state.log[self.volatile_state.last_applied].clone())
-                }
+                    min(heartbeat.leader_commit, self.persistent_state.log.len() - 1);
+            }
+
+            // If commitIndex > lastApplied: increment lastApplied,
+            // apply log[lastApplied] to state machine (§5.3)
+            if self.volatile_state.commit_index > self.volatile_state.last_applied {
+                self.volatile_state.last_applied += 1;
+                self.persistent_state
+                    .state_machine
+                    .push(self.persistent_state.log[self.volatile_state.last_applied].clone())
             }
 
             // TODO
@@ -398,6 +395,15 @@ impl RaftNode {
         if a.leader_commit > self.volatile_state.commit_index {
             self.volatile_state.commit_index =
                 min(a.leader_commit, self.persistent_state.log.len() - 1);
+        }
+
+        // If commitIndex > lastApplied: increment lastApplied,
+        // apply log[lastApplied] to state machine (§5.3)
+        if self.volatile_state.commit_index > self.volatile_state.last_applied {
+            self.volatile_state.last_applied += 1;
+            self.persistent_state
+                .state_machine
+                .push(self.persistent_state.log[self.volatile_state.last_applied].clone())
         }
 
         return (self.id, self.persistent_state.current_term, true).into();
@@ -548,7 +554,6 @@ impl RaftNode {
                 {
                     let mut this_node = this_clone.lock().unwrap();
                     if this_node.role == Role::Leader {
-                        this_node.send_heartbeat();
                         this_node.send_append_entries();
                     }
                 }
@@ -628,16 +633,15 @@ impl RaftNode {
         });
         (handle, tx)
     }
-    fn handle_connection(this: Arc<Mutex<Self>>, mut peer_stream: TcpStream) {
+    fn handle_connection(this: Arc<Mutex<Self>>, stream: TcpStream) {
         let node_id = this.lock().unwrap().id;
-        debug!(
-            "node {:?} handling connection {:?}",
-            node_id,
-            peer_stream.peer_addr()
-        );
+        let stream = Arc::new(Mutex::new(stream));
+        let addr = stream.lock().unwrap().peer_addr();
+        debug!("node {:?} handling connection {:?}", node_id, addr);
         loop {
             let mut buffer = [0; MESSAGE_LENGTH];
-            peer_stream.read(&mut buffer).unwrap();
+
+            stream.lock().unwrap().read(&mut buffer).unwrap();
             let m: CRCMessage = bincode::deserialize(&buffer).unwrap();
             if !m.check_crc() {
                 debug!("crc failed for {:?}", m);
@@ -646,15 +650,17 @@ impl RaftNode {
             let m = m.msg;
             debug!(
                 "node {:?} received message {:?} from node {:?}",
-                node_id,
-                m,
-                peer_stream.peer_addr(),
+                node_id, m, addr,
             );
 
             // TODO: moving this down from above let the other nodes catch up
             // i'm guessing continue doesn't drop the lock or something?
             let mut this = this.lock().unwrap();
             match m {
+                Message::C(c) => {
+                    let cr = Message::CR(this.handle_client_request(c));
+                    this.send_to_stream(stream.clone(), cr);
+                }
                 Message::P(p) => {
                     let pr = Message::PR(this.handle_ping(p));
                     this.send(p.pinger_id, pr);
@@ -711,6 +717,19 @@ impl RaftNode {
         let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
         peer_stream.write(&rpc_message_bin).unwrap();
         peer_stream.flush().unwrap();
+    }
+
+    fn send_to_stream(&self, stream: Arc<Mutex<TcpStream>>, message: Message) {
+        debug!(
+            "node {:?} sending message {:?} to {:?}",
+            self.id,
+            message,
+            stream.lock().unwrap().peer_addr()
+        );
+        let rpc_message = CRCMessage::new(message);
+        let rpc_message_bin = bincode::serialize(&rpc_message).unwrap();
+        stream.lock().unwrap().write(&rpc_message_bin).unwrap();
+        stream.lock().unwrap().flush().unwrap();
     }
 
     pub fn connect_to_peers(&mut self) {

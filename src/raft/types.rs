@@ -11,7 +11,7 @@ pub type LogTerm = u64;
 pub type NodeId = u64;
 pub type LogIndex = usize;
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, macros::FromTuple)]
 pub struct LogEntry {
     pub message: String,
     pub term: LogTerm,
