@@ -173,8 +173,8 @@ impl RaftNode {
         if self.persistent_state.voted_for.is_none()
             || self.persistent_state.voted_for.unwrap() == vr.candidate_id
         {
-            if self.get_last_log_term() == vr.last_log_term
-                && self.get_last_log_index() == vr.last_log_index
+            if self.get_last_log_index() <= vr.last_log_index
+                && self.get_last_log_term() <= vr.last_log_term
             {
                 self.persistent_state.voted_for = Some(vr.candidate_id);
                 return VoteRequestResponse {
@@ -253,7 +253,10 @@ impl RaftNode {
                 self.peers
                     .iter()
                     .map(|(&pid, _)| (pid, self.get_last_log_index() + 1)),
-            )
+            );
+            // and initializes match_index to be 0
+            self.leader_state.as_mut().unwrap().match_index =
+                HashMap::from_iter(self.peers.iter().map(|(&pid, _)| (pid, 0)))
         }
     }
 
