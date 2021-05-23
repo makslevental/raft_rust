@@ -166,7 +166,7 @@ def Init():
     global elections, timeouts, allLogs, voterLog, currentTerm, state, votedFor, votesResponded, votesGranted, nextIndex, matchIndex, log, commitIndex, messages
 
     elections = set()
-    timeouts = {i: Dict(timeout=randrange(1000, 2000) / 1000, previous_time=time.time()) for i in Server}
+    timeouts = {i: Dict(timeout=randrange(150, 300) / 1000, previous_time=time.time()) for i in Server}
     allLogs = set()
     voterLog = {i: {} for i in Server}
 
@@ -268,7 +268,7 @@ def AppendEntries(i, j):
             # mlog is used as a history variable for the proof.
             # It would not exist in a real implementation.
             mlog=log[i],
-            mcommitindex=min(commitIndex[i], lastEntry),
+            mcommitIndex=min(commitIndex[i], lastEntry),
             msource=i,
             mdest=j
         ))
@@ -285,8 +285,8 @@ def BecomeLeader(i):
 
     if state[i] == Candidate and votesGranted[i] in Quorum:
         state[i] = Leader
-        nextIndex[i] = {j: len(log[i]) - 1 for j in Server}
-        matchIndex[i] = {j: 0 for j in Server}
+        nextIndex[i] = {j: len(log[i]) for j in Server}
+        matchIndex[i] = {j: -1 for j in Server}
         elections = elections | {Dict(
             eterm=currentTerm[i],
             eleader=i,
@@ -324,9 +324,9 @@ def AdvanceCommitIndex(i):
         # The set of servers that agree up through index.
         Agree = lambda index: {i} | {k for k in Server if matchIndex[i][k] >= index}
         # The maximum indexes for which a quorum agrees
-        agreeIndexes = {index for index in range(0, len(log[i])) if Agree(index) in Quorum}
+        agreeIndexes = {index for index in range(-1, len(log[i])) if Agree(index) in Quorum}
         # New value for commitIndex'[i]
-        if agreeIndexes != {} and log[i][max(agreeIndexes)].term == currentTerm[i]:
+        if agreeIndexes != {} and agreeIndexes != {-1} and log[i][max(agreeIndexes)].term == currentTerm[i]:
             newCommitIndex = max(agreeIndexes)
         else:
             newCommitIndex = commitIndex[i]
@@ -406,7 +406,7 @@ def HandleAppendEntriesRequest(i, j, m):
     UNCHANGED_conflict = _(commitIndex, messages)
     UNCHANGED = _(votesResponded, votesGranted, voterLog, nextIndex, matchIndex, elections)
 
-    logOk = (m.mprevLogIndex == 0) or (
+    logOk = (m.mprevLogIndex == -1) or (
             m.mprevLogIndex > 0 and
             m.mprevLogIndex < len(log[i]) and
             m.mprevLogTerm == log[i][m.mprevLogIndex].term)
@@ -436,7 +436,7 @@ def HandleAppendEntriesRequest(i, j, m):
             index = m.mprevLogIndex + 1
 
             # already done with request
-            if m.mentries != [] and len(log[i]) - 1 >= index and log[i][index].term == m.mentries[1].term:
+            if m.mentries != [] and len(log[i]) - 1 >= index and log[i][index].term == m.mentries[0].term:
                 # This could make our commitIndex decrease (for
                 # example if we process an old, duplicated request),
                 # but that doesn't really affect anything.
@@ -453,15 +453,15 @@ def HandleAppendEntriesRequest(i, j, m):
                 assert UNCHANGED_serverVars(currentTerm, state, votedFor) and UNCHANGED_log(log)
 
             # conflict: remove 1 entry
-            if m.mentries != [] and len(log[i]) - 1 >= index and log[i][index].term != m.mentries[1].term:
+            if m.mentries != [] and len(log[i]) - 1 >= index and log[i][index].term != m.mentries[0].term:
                 new = (log[i][index2] for index2 in range(len(log[i]) - 1))
                 log[i] = new
 
                 assert UNCHANGED_serverVars(currentTerm, state, votedFor) and UNCHANGED_conflict(commitIndex, messages)
 
             # no conflict: append entry
-            if m.mentries != [] and len(log[i]) - 1 == m.mprevLogIndex:
-                log[i] = log[i] + (m.mentries[1],)
+            if len(m.mentries) and len(log[i]) - 1 == m.mprevLogIndex:
+                log[i] = log[i] + (m.mentries[0],)
 
                 assert UNCHANGED_serverVars(currentTerm, state, votedFor) and UNCHANGED_conflict(commitIndex, messages)
 
@@ -568,7 +568,7 @@ def DropMessage(m):
 def Next():
     global allLogs
 
-    for round in range(20):
+    for round in range(100):
         print("round ", round)
         if round == 0:
             for i in Server:
@@ -611,11 +611,11 @@ def Next():
             if messages[m] > 0:
                 DropMessage(m)
 
-        allLogs = allLogs | {log[i] for i in Server}
+        # allLogs = allLogs | {log[i] for i in Server}
 
-        time.sleep(0.1)
+        time.sleep(0.001)
 
-    pprint(allLogs)
+    pprint(log)
 
 
 if __name__ == '__main__':
